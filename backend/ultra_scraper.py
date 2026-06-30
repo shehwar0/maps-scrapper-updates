@@ -87,9 +87,11 @@ except Exception:  # pragma: no cover
 MAX_RESULTS_CAP = 500
 RESULT_SCAN_WINDOW = 320
 CITYWIDE_QUERY_LIMIT = 30
-MAP_STAGNANT_ROUNDS = 22
-MAP_SCROLL_DELAY_MIN = 0.28
-MAP_SCROLL_DELAY_MAX = 0.55
+MAP_STAGNANT_ROUNDS = 28
+MAP_SCROLL_DELAY_MIN = 0.35
+MAP_SCROLL_DELAY_MAX = 0.85
+URL_DISCOVERY_MAX_SEC = 240
+DISCOVERY_STABLE_ROUNDS_FOR_END = 4
 REQUEST_TIMEOUT = 15
 PARALLEL_WORKERS = 3
 QUERY_RETRY_ATTEMPTS = 2
@@ -106,10 +108,10 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
-LISTING_TIME_BUDGET_SEC = 90
-WEBSITE_ANALYSIS_BUDGET_SEC = 30
-HEAVY_STEP_MIN_REMAINING_SEC = 15
-GOOGLE_LOOKUP_MIN_REMAINING_SEC = 12
+LISTING_TIME_BUDGET_SEC = 60
+WEBSITE_ANALYSIS_BUDGET_SEC = 18
+HEAVY_STEP_MIN_REMAINING_SEC = 9
+GOOGLE_LOOKUP_MIN_REMAINING_SEC = 9
 SOCIAL_VERIFY_MIN_REMAINING_SEC = 12
 
 # Extended contact pages for ultra deep scan
@@ -611,14 +613,17 @@ class UltraDeepScraper:
             self.log.info(f"📊 History: {stats.get('search_total', 0)} previously scraped for this search, {stats.get('global_total', 0)} total")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
+            browser = p.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage", "--no-sandbox"],
+            )
             context = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1400, "height": 1000},
+                viewport={"width": 1366, "height": 900},
             )
             
             try:
@@ -784,17 +789,35 @@ class UltraDeepScraper:
             except Exception:
                 continue
 
+    def _is_end_of_results(self, page: Page) -> bool:
+        try:
+            try:
+                content = (page.content() or "").lower()
+            except Exception:
+                content = ""
+            markers = ("you've reached the end", "end of the list", "no more results", "reached the end")
+            if any(m in content for m in markers):
+                return True
+            try:
+                el = page.locator("div[role='status']").first
+                if el.count() > 0 and ("end" in (el.inner_text(timeout=500) or "").lower()):
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
     def _collect_place_urls(self, page: Page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
-        """Collect place URLs from Maps, filtering out previously scraped businesses."""
+        """Robust collection with end detection."""
         discovered: List[str] = []
         seen: Set[str] = set()
         stagnant_rounds = 0
-        max_stagnant_rounds = MAP_STAGNANT_ROUNDS + (4 if self.skip_duplicates else 0)
-        
+        max_stagnant_rounds = MAP_STAGNANT_ROUNDS + (6 if getattr(self, 'skip_duplicates', False) else 0)
+        start_time = time.time()
+
         if target_count is None:
-            duplicate_buffer = 0
-            if self.skip_duplicates:
-                duplicate_buffer = min(12, max(2, self.max_results // 12))
+            duplicate_buffer = min(18, max(3, self.max_results // 8))
             target_urls = self.max_results + duplicate_buffer
         else:
             target_urls = max(1, target_count)
@@ -803,9 +826,21 @@ class UltraDeepScraper:
         if "/maps/place/" in current_url:
             return [current_url]
 
+        feed = None
+        try:
+            feed = page.locator("div[role='feed']").first
+            if feed.count() == 0:
+                feed = None
+        except Exception:
+            feed = None
+
         while len(discovered) < target_urls and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
+            if (time.time() - start_time) > URL_DISCOVERY_MAX_SEC:
+                self.log.warning("Discovery budget hit.")
+                break
+
             before = len(discovered)
-            
+
             try:
                 hrefs = page.eval_on_selector_all(
                     "a.hfpxzc",
@@ -814,6 +849,7 @@ class UltraDeepScraper:
             except Exception:
                 hrefs = []
 
+            newly = 0
             if hrefs:
                 tail_start = max(0, len(hrefs) - RESULT_SCAN_WINDOW)
                 for href in hrefs[tail_start:]:
@@ -822,26 +858,34 @@ class UltraDeepScraper:
                     if href and href not in seen:
                         seen.add(href)
                         discovered.append(href)
+                        newly += 1
+
+            reached_end = self._is_end_of_results(page)
 
             if len(discovered) == before:
                 stagnant_rounds += 1
             else:
                 stagnant_rounds = 0
 
-            feed = page.locator("div[role='feed']").first
-            try:
-                feed.evaluate("el => el.scrollBy(0, el.scrollHeight)")
-            except Exception:
-                page.mouse.wheel(0, 4000)
+            if stagnant_rounds >= DISCOVERY_STABLE_ROUNDS_FOR_END and (reached_end or newly == 0):
+                break
 
-            self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
+            try:
+                if feed and feed.count() > 0:
+                    feed.evaluate("(el) => el.scrollBy(0, Math.floor(el.scrollHeight * .9) + 150)")
+                else:
+                    page.mouse.wheel(0, 4800)
+            except Exception:
+                try:
+                    page.evaluate("window.scrollBy(0, 4000)")
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(int(random.uniform(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX) * 1000))
             self._raise_if_captcha(page)
 
         self.log.info("📍 Discovered %d place URLs total (target %d)", len(discovered), self.max_results)
-        
-        # If deduplication is enabled, we'll filter in _ultra_extract_leads
-        # Return more URLs so we have room to filter
-        return discovered
+        return discovered[:target_urls]
 
     def _ultra_extract_leads(
         self,

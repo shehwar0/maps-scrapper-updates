@@ -19,14 +19,23 @@ from business_extractor import BusinessData, analyze_website
 from email_extractor import WebsiteExtractor
 from maps_city_coverage import build_citywide_queries
 from url_filters import is_business_website, normalize_business_website
+from scraper_utils import apply_stealth, block_heavy_resources, robust_scroll_to_end, create_dry_run_leads, safe_launch_browser
+
+try:
+    from fake_useragent import UserAgent
+    _UA = UserAgent()
+except Exception:
+    _UA = None
 
 PHONE_REGEX = re.compile(r"(\+?\d[\d\s()\-]{6,}\d)")
 MAX_RESULTS_CAP = 500
 RESULT_SCAN_WINDOW = 320
 CITYWIDE_QUERY_LIMIT = 30
-MAP_STAGNANT_ROUNDS = 22
-MAP_SCROLL_DELAY_MIN = 0.28
-MAP_SCROLL_DELAY_MAX = 0.55
+MAP_STAGNANT_ROUNDS = 28
+MAP_SCROLL_DELAY_MIN = 0.35
+MAP_SCROLL_DELAY_MAX = 0.85
+URL_DISCOVERY_MAX_SEC = 240
+DISCOVERY_STABLE_ROUNDS_FOR_END = 4
 QUERY_RETRY_ATTEMPTS = 2
 QUERY_RETRY_BASE_WAIT_MS = 2500
 CAPTCHA_MANUAL_WAIT_MS = 180000
@@ -41,9 +50,9 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
-LISTING_TIME_BUDGET_SEC = 55
-WEBSITE_ANALYSIS_BUDGET_SEC = 22
-HEAVY_STEP_MIN_REMAINING_SEC = 10
+LISTING_TIME_BUDGET_SEC = 45
+WEBSITE_ANALYSIS_BUDGET_SEC = 14
+HEAVY_STEP_MIN_REMAINING_SEC = 7
 
 # Pages to check for contact info (in order of priority)
 CONTACT_PAGES = ["", "/contact", "/contact-us", "/about", "/about-us", "/team"]
@@ -63,6 +72,7 @@ class GoogleMapsScraper:
         min_delay: float = 0.7,
         max_delay: float = 1.6,
         website_filter: str = "all",
+        dry_run: bool = False,
         logger: Optional[logging.Logger] = None,
         progress_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
@@ -71,6 +81,7 @@ class GoogleMapsScraper:
         self.min_delay = min_delay
         self.max_delay = max_delay
         self.website_filter = website_filter if website_filter in {"all", "with", "without"} else "all"
+        self.dry_run = dry_run
         self.log = logger or logging.getLogger(__name__)
         self.progress_callback = progress_callback
         self._website_cache: Dict[str, Dict] = {}
@@ -83,22 +94,19 @@ class GoogleMapsScraper:
     ) -> List[Dict[str, str]]:
         """Main scrape method."""
         stop_event = stop_event or Event()
-        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
+        if self.dry_run:
+            self.log.info("🧪 ENHANCED DRY-RUN (synthetic powerful test data)")
+            return create_dry_run_leads(keyword, location, self.max_results)
 
+        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
         if not search_queries:
             return []
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1400, "height": 1000},
-            )
+            browser, context = safe_launch_browser(p, headless=self.headless, logger=self.log)
             page = context.new_page()
+            apply_stealth(page)
+            block_heavy_resources(page)
             
             try:
                 if len(search_queries) > 1:
@@ -182,29 +190,37 @@ class GoogleMapsScraper:
         raise RuntimeError(f"Search failed for query: {query}")
     
     def _open_and_search(self, page: Page, query: str) -> None:
-        """Navigate to Google Maps and search."""
         encoded_query = quote_plus(query)
-        page.goto(f"https://www.google.com/maps/search/{encoded_query}", timeout=90000)
-        page.wait_for_timeout(1200)
+        try:
+            page.goto(f"https://www.google.com/maps/search/{encoded_query}", timeout=70000, wait_until="domcontentloaded")
+        except Exception:
+            page.goto("https://www.google.com/maps", timeout=25000)
+        page.wait_for_timeout(1000)
         self._maybe_accept_consent(page)
         self._raise_if_captcha(page)
         
-        if self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc"], timeout_ms=45000):
-            self._human_delay()
+        if self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc"], timeout_ms=36000):
+            page.wait_for_timeout(550)
             return
         
         search_input = self._find_search_input(page)
         if search_input:
-            search_input.fill(query)
-            self._human_delay()
-            search_input.press("Enter")
+            try:
+                search_input.fill(query)
+                self._human_delay(0.15, 0.4)
+                search_input.press("Enter")
+            except Exception:
+                pass
         
-        if not self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc", "h1.DUwDvf"], timeout_ms=45000):
-            raise RuntimeError(
-                "Google Maps results did not load. This can happen due to consent/CAPTCHA, network issues, or UI changes."
-            )
+        if not self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc", "h1.DUwDvf"], timeout_ms=38000):
+            try:
+                page.reload(timeout=15000)
+            except Exception:
+                pass
+            if not self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc"], timeout_ms=15000):
+                raise RuntimeError("Google Maps results failed to load.")
         
-        self._human_delay()
+        self._human_delay(0.25, 0.55)
         self._raise_if_captcha(page)
     
     def _find_search_input(self, page: Page):
@@ -226,8 +242,8 @@ class GoogleMapsScraper:
         return None
     
     def _wait_for_any(self, page: Page, selectors: List[str], timeout_ms: int) -> bool:
-        """Wait for any of the given selectors to appear."""
         deadline = time.time() + (timeout_ms / 1000)
+        poll = 280
         while time.time() < deadline:
             for selector in selectors:
                 try:
@@ -235,7 +251,8 @@ class GoogleMapsScraper:
                         return True
                 except Exception:
                     continue
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(poll)
+            poll = min(600, int(poll * 1.08))
         return False
     
     def _maybe_accept_consent(self, page: Page) -> None:
@@ -257,22 +274,56 @@ class GoogleMapsScraper:
             except Exception:
                 continue
     
+    def _is_end_of_results(self, page: Page) -> bool:
+        try:
+            try:
+                content = (page.content() or "").lower()
+            except Exception:
+                content = ""
+            end_markers = ("you've reached the end", "end of the list", "no more results", "reached the end", "no other results")
+            if any(m in content for m in end_markers):
+                return True
+            for sel in ["div[role='status']"]:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        txt = (el.inner_text(timeout=600) or "").lower()
+                        if "end" in txt or "no more" in txt:
+                            return True
+                except Exception:
+                    pass
+            return False
+        except Exception:
+            return False
+
     def _collect_place_urls(self, page: Page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
-        """Collect all place URLs from search results."""
+        """Robust URL collection (end detection + time budget)."""
         discovered: List[str] = []
         seen: Set[str] = set()
         stagnant_rounds = 0
         max_stagnant_rounds = MAP_STAGNANT_ROUNDS
         target_urls = max(1, target_count or self.max_results)
-        
+        start_time = time.time()
+
         current_url = page.url or ""
         if "/maps/place/" in current_url:
             return [current_url][:target_urls]
-        
+
+        feed = None
+        try:
+            feed = page.locator("div[role='feed']").first
+            if feed.count() == 0:
+                feed = None
+        except Exception:
+            feed = None
+
         while len(discovered) < target_urls and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
+            if (time.time() - start_time) > URL_DISCOVERY_MAX_SEC:
+                self.log.warning("Discovery budget exhausted.")
+                break
+
             before = len(discovered)
             hrefs: List[str] = []
-            
             try:
                 hrefs = page.eval_on_selector_all(
                     "a.hfpxzc",
@@ -280,7 +331,8 @@ class GoogleMapsScraper:
                 )
             except Exception:
                 hrefs = []
-            
+
+            newly = 0
             if hrefs:
                 tail_start = max(0, len(hrefs) - RESULT_SCAN_WINDOW)
                 for href in hrefs[tail_start:]:
@@ -289,39 +341,50 @@ class GoogleMapsScraper:
                     if href and href not in seen:
                         seen.add(href)
                         discovered.append(href)
+                        newly += 1
             else:
-                links = page.locator("a.hfpxzc")
-                count = links.count()
-                start_idx = max(0, count - RESULT_SCAN_WINDOW)
-                
-                for idx in range(start_idx, count):
-                    if stop_event.is_set() or len(discovered) >= target_urls:
-                        break
-                    href = ""
-                    for _ in range(2):
-                        try:
-                            href = links.nth(idx).get_attribute("href") or ""
+                try:
+                    links = page.locator("a.hfpxzc")
+                    count = links.count()
+                    start_idx = max(0, count - RESULT_SCAN_WINDOW)
+                    for idx in range(start_idx, count):
+                        if stop_event.is_set() or len(discovered) >= target_urls:
                             break
+                        try:
+                            href = links.nth(idx).get_attribute("href", timeout=1200) or ""
+                            if href and href not in seen:
+                                seen.add(href)
+                                discovered.append(href)
+                                newly += 1
                         except PlaywrightTimeoutError:
-                            self._human_delay(0.6, 1.2)
-                    if href and href not in seen:
-                        seen.add(href)
-                        discovered.append(href)
-            
+                            continue
+                except Exception:
+                    pass
+
+            reached_end = self._is_end_of_results(page)
+
             if len(discovered) == before:
                 stagnant_rounds += 1
             else:
                 stagnant_rounds = 0
-            
-            feed = page.locator("div[role='feed']").first
+
+            if stagnant_rounds >= DISCOVERY_STABLE_ROUNDS_FOR_END and (reached_end or newly == 0):
+                break
+
             try:
-                feed.evaluate("el => el.scrollBy(0, el.scrollHeight)")
+                if feed and feed.count() > 0:
+                    feed.evaluate("(el) => el.scrollBy(0, Math.floor(el.scrollHeight*0.9) + 160)")
+                else:
+                    page.mouse.wheel(0, 4800)
             except Exception:
-                page.mouse.wheel(0, 4000)
-            
-            self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
+                try:
+                    page.evaluate("window.scrollBy(0, 4200)")
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(int(random.uniform(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX) * 1000))
             self._raise_if_captcha(page)
-        
+
         self.log.info("Discovered %s place urls", len(discovered))
         return discovered[:target_urls]
     
@@ -342,7 +405,10 @@ class GoogleMapsScraper:
             self.log.info("Processing %s/%s", index, len(place_urls))
             
             # Create a new page for each listing to avoid state issues
-            page = context.new_page()
+            # Use reusable page for speed (create once)
+            if not hasattr(self, "_detail_page") or self._detail_page is None:
+                self._detail_page = context.new_page()
+            page = self._detail_page
             try:
                 lead = self._extract_full_listing(page, place_url)
                 if lead:
@@ -354,14 +420,23 @@ class GoogleMapsScraper:
                             try:
                                 self.progress_callback(lead.to_dict())
                             except Exception:
-                                # Progress callbacks should never interrupt scraping.
                                 pass
             except Exception as e:
                 self.log.error("Failed to extract %s: %s", place_url, e)
-            finally:
-                page.close()
-            
-            self._human_delay(0.2, 0.45)
+                try:
+                    page.goto("https://www.google.com/maps", timeout=12000)
+                    page.wait_for_timeout(300)
+                except Exception:
+                    pass
+            self._human_delay(0.15, 0.4)
+        
+        # cleanup reusable page (context will close anyway)
+        if hasattr(self, "_detail_page") and self._detail_page:
+            try:
+                self._detail_page.close()
+            except Exception:
+                pass
+            self._detail_page = None
         
         return leads
     
@@ -379,8 +454,8 @@ class GoogleMapsScraper:
         for attempt in range(2):
             try:
                 start_time = time.time()
-                page.goto(place_url, timeout=60000)
-                page.wait_for_timeout(1500)
+                page.goto(place_url, timeout=38000)
+                page.wait_for_timeout(800)
                 self._raise_if_captcha(page)
                 
                 # Create business data object
@@ -688,11 +763,12 @@ class GoogleMapsScraper:
 
         # ---- Phase 1: HTTP crawl (fast) ----
         try:
-            crawler = WebsiteExtractor(timeout=12)
+            crawler = WebsiteExtractor(timeout=9)
             pages = crawler.crawl_pages(
                 base_url,
-                max_pages=10,
+                max_pages=5,
                 max_total_time_sec=max_total_time_sec,
+                priority_only=True,
             )
             if pages:
                 corpus = "\n\n".join(p.html for p in pages if p.html)

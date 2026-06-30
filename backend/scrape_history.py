@@ -17,6 +17,13 @@ from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
 import logging
 
+try:
+    from rapidfuzz import fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+    fuzz = None
+
 # History file location
 HISTORY_DIR = Path(__file__).parent.parent / "output" / "history"
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -188,22 +195,42 @@ class ScrapeHistory:
             self.log.error(f"Failed to save search history: {e}")
     
     def is_duplicate(self, business: Dict, keyword: str = "", location: str = "") -> bool:
-        """Check if a business has already been scraped."""
+        """Check if a business has already been scraped.
+        Uses rapidfuzz for powerful fuzzy deduplication when available.
+        """
         business_id = self._get_business_id(business)
         if not business_id:
             return False
         
-        # Check global history
+        # Exact global match
         if business_id in self._global_history:
             return True
         
-        # Check search-specific history if provided
+        # Search specific exact
         if keyword and location:
             search_key = self._get_search_key(keyword, location)
             search_history = self._load_search_history(search_key)
             if business_id in search_history:
                 return True
         
+        # Advanced fuzzy dedup (very powerful for catching near-duplicates)
+        if RAPIDFUZZ_AVAILABLE:
+            name = str(business.get("name") or "").lower().strip()
+            phone = str(business.get("phone") or "").strip()
+            address = str(business.get("address") or "").lower().strip()[:80]
+            
+            for ex_id, ex in list(self._global_history.items())[-300:]:
+                ex_name = str(ex.get("name") or "").lower().strip()
+                ex_phone = str(ex.get("phone") or "").strip()
+                ex_addr = str(ex.get("address") or "").lower().strip()[:80]
+                
+                if phone and phone == ex_phone:
+                    return True
+                if name and ex_name:
+                    name_score = fuzz.ratio(name, ex_name)
+                    addr_score = fuzz.ratio(address, ex_addr) if address and ex_addr else 0
+                    if name_score >= 93 or (name_score >= 87 and addr_score >= 78):
+                        return True
         return False
     
     def add_to_history(self, business: Dict, keyword: str = "", location: str = "") -> None:

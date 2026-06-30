@@ -1,17 +1,64 @@
-# Core
+# =============================================================================
+# Google Maps + Deep Web Lead Scraper - Production Requirements (Optimized)
+# =============================================================================
+#
+# This file is carefully crafted for:
+# - MAXIMUM PERFORMANCE (fast parsing, serialization, HTTP, dedup)
+# - HIGH SUCCESS RATE (stealth, smart retries, realistic UAs)
+# - POWERFUL DATA HANDLING (rich extraction, validation, advanced processing)
+# - PRODUCTION RELIABILITY (config, resilience, monitoring)
+#
+# Recommended one-time setup:
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#   python -m playwright install chromium     # CRITICAL for real browser power
+#
+# Why each package exists (performance & power reasons):
+#   selectolax + lxml + trafilatura  → Extremely fast + clean content extraction
+#   orjson + pandas                  → Blazing serialization + advanced data ops
+#   httpx[http2]                     → Modern fast HTTP
+#   tenacity                         → Efficient retries (don't waste time)
+#   fake-useragent                   → Avoid blocks → higher throughput
+#   rapidfuzz                        → Fast accurate deduplication
+#   tqdm                             → Visibility on long powerful runs
+#   pydantic                         → Reliable data models
+# =============================================================================
+
+# --- Core ---
 Flask==3.0.3
 playwright==1.51.0
 
-# HTML Parsing - Using selectolax for 25x faster parsing (C/Cython Lexbor engine)
-selectolax>=0.3.0
-lxml>=5.0.0
+# --- Ultra-Fast + High-Quality Extraction ---
+selectolax>=0.3.0              # Cython/Lexbor - 25x+ faster than BS4
+lxml>=5.0.0                    # Fast parser backend
+trafilatura>=1.6.0             # Best-in-class main content extraction (removes boilerplate, great for business sites)
 
-# HTTP Client - Using httpx for async + HTTP/2 support
-httpx[http2]>=0.27.0
+# --- High-Performance Data & Serialization ---
+orjson>=3.9.0                  # Rust JSON - 10x faster than stdlib
+pandas>=2.0.0                  # Powerful DataFrames: filtering, dedup, export to CSV/Excel/Parquet
 
-# JSON - Using orjson for 10x faster serialization (Rust-based)
-orjson>=3.9.0
+# --- Modern Fast HTTP ---
+httpx[http2]>=0.27.0           # HTTP/2 + connection pooling (major speed win)
 
-# Legacy fallback
+# --- Fallbacks (robustness) ---
 beautifulsoup4==4.12.3
 requests==2.32.3
+
+# --- Stealth, Resilience & Production Power ---
+tenacity>=8.2.0                # Smart exponential backoff retries
+fake-useragent>=1.4.0          # Realistic rotating User-Agents (huge anti-block power)
+python-dotenv>=1.0.0           # .env config for prod tuning
+
+# --- Advanced Deduplication & Validation ---
+rapidfuzz>=3.0.0               # Extremely fast fuzzy matching for high-quality dedup
+pydantic>=2.5.0                # Strong data models & validation
+
+# --- UX for Long Powerful Runs ---
+tqdm>=4.66.0                   # Real-time progress bars
+
+# --- Optional (uncomment for extra scale/power) ---
+# cachetools>=5.3.0            # In-memory caching
+# diskcache>=5.6.0             # Persistent disk cache
+# openpyxl>=3.1.0              # Excel export
+# xlsxwriter>=3.1.0            # Fast Excel writer

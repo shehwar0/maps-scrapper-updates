@@ -2,12 +2,26 @@ import re
 import time
 from dataclasses import dataclass
 from html import unescape
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
+
+# Production boosters
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    from fake_useragent import UserAgent
+    _TENACITY_AVAILABLE = True
+    _UA = UserAgent()
+except Exception:
+    _TENACITY_AVAILABLE = False
+    _UA = None
+    def retry(*a, **k): return lambda f: f  # no-op fallback
+    def stop_after_attempt(n): return None
+    def wait_exponential(*a, **k): return None
+    def retry_if_exception_type(*a): return None
 
 # Reduce noise when scraping sites with broken TLS (we intentionally allow verify=False)
 try:  # pragma: no cover
@@ -22,6 +36,11 @@ try:
     from selectolax.parser import HTMLParser
 except Exception:  # pragma: no cover
     HTMLParser = None
+
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
 
 try:
     import orjson as _json
@@ -90,51 +109,32 @@ GENERIC_PHONE_PATTERN = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 DIGIT_PATTERN = re.compile(r"\d+")
 
 # Prioritized internal pages and keywords for deep enrichment
+# Expanded for VERY POWERFUL web scraping
 PRIMARY_PATHS = [
-    "",
-    "/contact",
-    "/contact-us",
-    "/about",
-    "/about-us",
+    "", "/contact", "/contact-us", "/contactus", "/about", "/about-us", "/aboutus",
+    "/team", "/reach-us", "/get-in-touch", "/connect", "/locations", "/branches",
 ]
 
 DEFAULT_PATHS = [
-    "",
-    "/contact",
-    "/contact-us",
-    "/contactus",
-    "/reach-us",
-    "/get-in-touch",
-    "/connect",
-    "/about",
-    "/about-us",
-    "/aboutus",
-    "/team",
-    "/support",
-    "/help",
-    "/customer-service",
-    "/privacy",
-    "/terms",
-    "/legal",
-    "/impressum",
-    "/kontakt",
-    "/contacto",
+    "", "/contact", "/contact-us", "/contactus", "/about", "/about-us", "/aboutus",
+    "/team", "/reach-us", "/get-in-touch", "/connect", "/support", "/help",
+    "/customer-service", "/locations", "/branches", "/stores", "/privacy", "/terms",
+    "/legal", "/impressum", "/kontakt", "/contacto", "/info", "/services",
 ]
 
 PRIORITY_LINK_KEYWORDS = (
-    "contact",
-    "about",
-    "team",
-    "support",
-    "help",
-    "email",
-    "sales",
-    "privacy",
-    "terms",
-    "legal",
-    "impressum",
-    "whatsapp",
+    "contact", "about", "team", "support", "help", "email", "sales", "privacy",
+    "terms", "legal", "impressum", "whatsapp", "location", "branch", "store",
+    "service", "staff", "people", "directory", "find-us", "get-in-touch",
 )
+
+# Extra powerful patterns for business intel
+DESCRIPTION_PATTERNS = [
+    r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<p[^>]{0,100}class=["\'][^"\']*(?:about|intro|description|summary)[^"\']*["\'][^>]*>(.*?)</p>',
+]
+
+SERVICE_KEYWORDS = ["service", "services", "offer", "we provide", "our work", "solutions"]
 
 
 @dataclass
@@ -152,31 +152,25 @@ class WebsiteExtractor:
     def __init__(self, timeout: int = 12) -> None:
         self.timeout = timeout
 
-        self._requests_session = requests.Session()
-        self._requests_session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-            }
+        # Rotate realistic UAs (fake-useragent dramatically reduces blocks -> faster effective throughput)
+        ua_str = _UA.random if _UA else (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
         )
+        self._requests_session = requests.Session()
+        self._requests_session.headers.update({"User-Agent": ua_str})
 
         self._httpx = httpx.Client(
             http2=True,
             follow_redirects=True,
-            timeout=httpx.Timeout(self.timeout, connect=min(8, self.timeout)),
+            timeout=httpx.Timeout(min(self.timeout, 14), connect=min(5, self.timeout)),
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": ua_str,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
             verify=False,
         )
 
@@ -191,50 +185,311 @@ class WebsiteExtractor:
         self,
         website_url: str,
         fallback_phone: str = "",
-        max_pages: int = 10,
-        max_total_time_sec: int = 25,
+        max_pages: int = 18,  # Increased for very powerful web scraping
+        max_total_time_sec: int = 35,
         priority_only: bool = False,
-    ) -> Dict[str, str]:
-        """Return {email, whatsapp} by crawling a small set of internal pages."""
+        use_playwright: bool = True,  # Powerful: use browser for JS-heavy sites
+    ) -> Dict[str, Any]:
+        """
+        VERY POWERFUL web enrichment.
+        Returns rich dict: email, whatsapp, all_emails, all_phones, socials, description,
+        address, services, etc.
+        Uses fast HTTP + deep Playwright when needed.
+        """
         if not website_url:
-            return {"email": "", "whatsapp": self._normalize_phone(fallback_phone)}
+            return self._empty_result(fallback_phone)
 
         normalized = self._normalize_url(website_url)
         if not normalized:
-            return {"email": "", "whatsapp": self._normalize_phone(fallback_phone)}
+            return self._empty_result(fallback_phone)
 
+        base_domain = self._get_base_domain(normalized)
+
+        # Phase 1: Fast HTTP crawl (always)
         pages = self.crawl_pages(
             normalized,
             max_pages=max_pages,
             max_total_time_sec=max_total_time_sec,
             priority_only=priority_only,
         )
-        if not pages:
-            return {"email": "", "whatsapp": self._normalize_phone(fallback_phone)}
 
-        base_domain = self._get_base_domain(normalized)
-        emails: List[str] = []
-        whatsapp_numbers: List[str] = []
+        # Phase 2: Powerful Playwright fallback / enhancement for key pages (if enabled and time left)
+        if use_playwright and pages:
+            try:
+                pw_pages = self._playwright_crawl_powerful(normalized, max_pages=6, max_time_sec=18)
+                pages.extend(pw_pages)
+            except Exception:
+                pass  # graceful
+
+        if not pages:
+            return self._empty_result(fallback_phone)
+
+        # Aggregate from all pages (VERY DEEP POWERFUL)
+        all_emails: List[str] = []
+        all_phones: List[str] = []
+        all_whatsapp: List[str] = []
+        socials: Dict[str, str] = {}
+        descriptions: List[str] = []
+        addresses: List[str] = []
+        services: List[str] = []
+        structured_services = []
+        hours = ""
+
+        corpus = "\n\n".join(p.html for p in pages)
 
         for page in pages:
-            page_emails = self._extract_emails(page.html)
-            page_whatsapp = self._extract_whatsapp_numbers(page.html)
+            html = page.html
+            all_emails.extend(self._extract_emails(html))
+            phones = self._extract_phones_deep(html)
+            all_phones.extend(phones)
+            all_whatsapp.extend(self._extract_whatsapp_numbers(html))
 
-            for email in page_emails:
-                if email and email not in emails:
-                    emails.append(email)
-            for number in page_whatsapp:
-                if number and number not in whatsapp_numbers:
-                    whatsapp_numbers.append(number)
+            # Use trafilatura for superior main content extraction if available (huge power boost for business info)
+            clean_text = ""
+            if trafilatura:
+                try:
+                    clean_text = trafilatura.extract(html, include_comments=False, include_tables=False) or ""
+                except Exception:
+                    clean_text = html
+            else:
+                clean_text = html
 
-            # If we already have both, stop early.
-            if emails and whatsapp_numbers:
-                break
+            desc = self._extract_description(clean_text) or self._extract_description(html)
+            if desc:
+                descriptions.append(desc)
+            addr = self._extract_address(clean_text) or self._extract_address(html)
+            if addr:
+                addresses.append(addr)
+            svcs = self._extract_services(clean_text) or self._extract_services(html)
+            services.extend(svcs)
 
-        emails = self._rank_emails(emails, base_domain)
-        whatsapp = whatsapp_numbers[0] if whatsapp_numbers else self._normalize_phone(fallback_phone)
-        email = emails[0] if emails else ""
-        return {"email": email, "whatsapp": whatsapp}
+            h = self._extract_hours_deep(clean_text) or self._extract_hours_deep(html)
+            if h:
+                hours = h
+
+            page_socials = self._extract_socials(html)
+            for k, v in page_socials.items():
+                if k not in socials:
+                    socials[k] = v
+
+            # Structured deep data
+            struct = self._extract_structured_data(html)
+            if struct.get("description"):
+                descriptions.append(struct["description"])
+            if struct.get("address"):
+                addresses.append(struct["address"])
+            if struct.get("services"):
+                structured_services.extend(struct.get("services", []))
+            if struct.get("phone"):
+                all_phones.append(struct["phone"])
+            if struct.get("email"):
+                all_emails.append(struct["email"])
+            if struct.get("hours"):
+                hours = struct["hours"]
+
+        # Dedup + rank powerfully
+        emails = self._rank_emails(list(dict.fromkeys(all_emails)), base_domain)
+        phones = list(dict.fromkeys([p for p in all_phones if len(p.replace('+','')) >= 8]))[:8]
+        whatsapp = list(dict.fromkeys(all_whatsapp))[:5]
+        services = list(dict.fromkeys(services + structured_services))[:10]
+
+        best_email = emails[0] if emails else ""
+        best_whatsapp = whatsapp[0] if whatsapp else self._normalize_phone(fallback_phone)
+
+        return {
+            "email": best_email,
+            "whatsapp": best_whatsapp,
+            "all_emails": "; ".join(emails[:8]),
+            "all_phones": "; ".join(phones[:6]),
+            "all_whatsapp": "; ".join(whatsapp),
+            "socials": socials,
+            "description": " | ".join([d for d in descriptions if d][:2]),
+            "address_from_site": addresses[0] if addresses else "",
+            "services": ", ".join(services),
+            "pages_crawled": len(pages),
+            "structured_data_found": bool(structured_services or any(addresses)),
+            # Deep web fields
+            "about_text": " | ".join([d for d in descriptions if d][:3]),
+            "full_services": services,
+            "hours": hours or "",
+        }
+
+    def _empty_result(self, fallback_phone: str) -> Dict[str, Any]:
+        return {
+            "email": "", "whatsapp": self._normalize_phone(fallback_phone),
+            "all_emails": "", "all_phones": "", "all_whatsapp": "",
+            "socials": {}, "description": "", "address_from_site": "", "services": "",
+            "pages_crawled": 0,
+        }
+
+    def _playwright_crawl_powerful(self, base_url: str, max_pages: int = 6, max_time_sec: int = 18) -> List[CrawledPage]:
+        """DEEP POWERFUL Playwright: stealth, resource block, JS render, extract hidden/dynamic content from business sites."""
+        from playwright.sync_api import sync_playwright
+        crawled: List[CrawledPage] = []
+        start = time.time()
+
+        contact_pages = ["/contact", "/contact-us", "/about", "/about-us", "/team", ""]
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"])
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    viewport={"width": 1366, "height": 900},
+                )
+                page = context.new_page()
+
+                # Deep stealth from research
+                page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    window.chrome = { runtime: {} };
+                """)
+
+                # Block heavy for speed (research best practice)
+                page.route("**/*", lambda route, req: route.abort() if req.resource_type in ["image", "font", "media"] else route.continue_())
+
+                for path in contact_pages:
+                    if time.time() - start > max_time_sec or len(crawled) >= max_pages:
+                        break
+                    url = urljoin(base_url + "/", path.lstrip("/"))
+                    try:
+                        page.goto(url, timeout=15000, wait_until="networkidle")
+                        page.wait_for_timeout(1200)  # deep JS settle + human
+                        # Simulate human scroll
+                        page.evaluate("window.scrollBy(0, 300)")
+                        html = page.content()
+                        if html and len(html) > 800:
+                            crawled.append(CrawledPage(url=url, html=html))
+                    except Exception:
+                        continue
+
+                context.close()
+                browser.close()
+        except Exception:
+            pass
+
+        return crawled
+
+    def _extract_all_phones(self, html: str) -> List[str]:
+        """Extract all phone numbers (more aggressive)."""
+        phones = []
+        for m in GENERIC_PHONE_PATTERN.finditer(html):
+            cleaned = re.sub(r"[^\d+]", "", m.group(0))
+            if 8 <= len(cleaned.replace("+", "")) <= 15:
+                phones.append(cleaned)
+        return list(dict.fromkeys(phones))[:10]
+
+    def _extract_socials(self, html: str) -> Dict[str, str]:
+        socials = {}
+        patterns = {
+            "instagram": r'https?://(?:www\.)?instagram\.com/([a-zA-Z0-9_.]+)/?',
+            "facebook": r'https?://(?:www\.)?facebook\.com/([a-zA-Z0-9./_-]+)/?',
+            "linkedin": r'https?://(?:www\.)?linkedin\.com/(?:company|in)/([a-zA-Z0-9_-]+)/?',
+            "twitter": r'https?://(?:www\.)?(?:twitter|x)\.com/([a-zA-Z0-9_]+)/?',
+            "tiktok": r'https?://(?:www\.)?tiktok\.com/@([a-zA-Z0-9_.]+)/?',
+            "youtube": r'https?://(?:www\.)?youtube\.com/(?:@|channel/|c/)([a-zA-Z0-9_-]+)/?',
+        }
+        for platform, pat in patterns.items():
+            m = re.search(pat, html, re.I)
+            if m:
+                socials[platform] = m.group(0).split("?")[0]
+        return socials
+
+    def _extract_description(self, html: str) -> str:
+        for pat in DESCRIPTION_PATTERNS:
+            m = re.search(pat, html, re.I | re.S)
+            if m:
+                text = re.sub(r"<[^>]+>", " ", m.group(1)).strip()
+                if len(text) > 30:
+                    return text[:280]
+        return ""
+
+    def _extract_address(self, html: str) -> str:
+        # Look for schema or common address blocks
+        patterns = [
+            r'"address":\s*\{[^}]*"streetAddress":\s*"([^"]+)"',
+            r'<span[^>]*itemprop=["\']streetAddress["\'][^>]*>(.*?)</span>',
+            r'(?:address|location|find us)[^<]{0,60}<[^>]+>([^<]{10,120})',
+        ]
+        for p in patterns:
+            m = re.search(p, html, re.I | re.S)
+            if m:
+                return re.sub(r"<[^>]+>", "", m.group(1)).strip()[:160]
+        return ""
+
+    def _extract_services(self, html: str) -> List[str]:
+        services = []
+        lower = html.lower()
+        for kw in SERVICE_KEYWORDS:
+            if kw in lower:
+                matches = re.findall(r'([A-Z][a-z]+(?:\s+[A-Z]?[a-z]+){1,4})', html)
+                services.extend(matches[:5])
+        # Deep: look for list items or headings with service-like
+        for m in re.finditer(r'<(li|h[1-6])[^>]*>(.*?)</\1>', html, re.I | re.S):
+            text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+            if text and len(text) > 3 and len(text) < 100:
+                services.append(text)
+        return list(dict.fromkeys(services))[:10]
+
+    def _extract_hours_deep(self, html: str) -> str:
+        # Look for common hours patterns
+        patterns = [
+            r'(?:hours|opening|open)\s*[:\-]?\s*([^<]{10,200})',
+            r'itemprop=["\']openingHours["\'][^>]*>([^<]+)<',
+            r'<time[^>]*>([^<]+)</time>',
+        ]
+        for p in patterns:
+            m = re.search(p, html, re.I | re.S)
+            if m:
+                return re.sub(r'\s+', ' ', m.group(1)).strip()[:150]
+        return ""
+
+    def _extract_structured_data(self, html: str) -> Dict[str, Any]:
+        """Deep extraction from JSON-LD, schema.org for business data (very powerful)."""
+        data = {"description": "", "address": "", "services": [], "phone": "", "email": "", "hours": ""}
+        try:
+            # JSON-LD
+            for script in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
+                try:
+                    obj = _loads_json(script.strip())
+                    if isinstance(obj, list):
+                        obj = obj[0] if obj else {}
+                    if obj.get("@type") in ["LocalBusiness", "Organization", "Corporation", "Restaurant", "Store"]:
+                        data["description"] = obj.get("description", "") or data["description"]
+                        addr = obj.get("address", {})
+                        if isinstance(addr, dict):
+                            data["address"] = addr.get("streetAddress", "") or data["address"]
+                        data["phone"] = obj.get("telephone", "") or data["phone"]
+                        data["email"] = obj.get("email", "") or data["email"]
+                        if "openingHours" in obj:
+                            data["hours"] = obj.get("openingHours", "")
+                        if "offers" in obj or "hasOfferCatalog" in obj or "menu" in str(obj).lower():
+                            data["services"].append("Offers / Menu available")
+                except:
+                    pass
+
+            # Microdata or other
+            if "itemprop" in html:
+                for m in re.finditer(r'itemprop=["\']description["\'][^>]*>(.*?)<', html, re.I | re.S):
+                    data["description"] = data["description"] or m.group(1).strip()[:300]
+        except:
+            pass
+        return data
+
+    def _extract_phones_deep(self, html: str) -> List[str]:
+        """Very deep phone extraction with more patterns."""
+        phones = []
+        # tel: links, data, visible
+        for m in re.finditer(r'tel:([+0-9\s\-()]+)', html, re.I):
+            phones.append(re.sub(r'[^\d+]', '', m.group(1)))
+        for m in re.finditer(r'["\'](?:phone|tel|contact)["\']\s*:\s*["\']([^"\']+)["\']', html, re.I):
+            phones.append(re.sub(r'[^\d+]', '', m.group(1)))
+        for m in GENERIC_PHONE_PATTERN.finditer(html):
+            p = re.sub(r'[^\d+]', '', m.group(0))
+            if 8 <= len(p.replace('+','')) <= 15:
+                phones.append(p)
+        return list(dict.fromkeys([p for p in phones if p]))[:8]
 
     def crawl_pages(
         self,
@@ -311,6 +566,8 @@ class WebsiteExtractor:
                 if any(k in ml for k in PRIORITY_LINK_KEYWORDS):
                     to_visit.append(m.strip())
 
+        # Powerful deep crawl
+        crawled_count = 0
         while to_visit and len(crawled) < max_pages:
             if _time_exceeded():
                 break
@@ -325,17 +582,25 @@ class WebsiteExtractor:
 
             seen.add(norm_url)
             html = self._safe_get_html(norm_url, max_bytes=max_bytes_per_page)
-            if not html:
+            if not html or len(html) < 400:
                 continue
 
             crawled.append(CrawledPage(url=norm_url, html=html))
+            crawled_count += 1
 
-            # Discover more internal candidate links from the first 1-2 pages
-            if len(crawled) <= 2 and len(crawled) < max_pages:
-                if _time_exceeded():
-                    break
-                for link in self._discover_priority_links(html, base):
-                    if link not in seen and link not in to_visit:
+            # VERY POWERFUL: aggressive link discovery from every crawled page
+            if len(crawled) < max_pages:
+                new_links = self._discover_priority_links(html, base)
+                # Also extract any other internal links that look useful
+                extra = re.findall(r'href=["\'](/[^"\']+?)["\']', html, re.I)
+                for ex in extra[:15]:
+                    full = urljoin(base + "/", ex.lstrip("/"))
+                    if full not in seen and full not in to_visit and self._is_same_site(base, full):
+                        if any(k in full.lower() for k in PRIORITY_LINK_KEYWORDS + ("service", "location", "product")):
+                            to_visit.append(full)
+
+                for link in new_links:
+                    if link not in to_visit:
                         to_visit.append(link)
 
         return crawled
@@ -386,6 +651,12 @@ class WebsiteExtractor:
     def _safe_get_text(self, url: str, max_bytes: int = 600_000) -> str:
         return self._safe_get_html(url, max_bytes=max_bytes)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        retry=retry_if_exception_type((httpx.RequestError, requests.RequestException)),
+        reraise=True,
+    )
     def _safe_get_html(self, url: str, max_bytes: int = 1_500_000) -> str:
         url = (url or "").strip()
         if not url:
@@ -397,7 +668,7 @@ class WebsiteExtractor:
         if host in self._blocked_hosts:
             return ""
 
-        # httpx first (faster, HTTP/2), then requests fallback
+        # httpx first (faster, HTTP/2)
         text = ""
         try:
             r = self._httpx.get(url)
@@ -465,11 +736,13 @@ class WebsiteExtractor:
 
         def consider(href: str, anchor_text: str = "") -> None:
             href = (href or "").strip()
-            if not href or href.startswith(("mailto:", "tel:", "javascript:")):
+            if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
                 return
             href_l = href.lower()
             text_l = (anchor_text or "").lower()
-            if any(k in href_l for k in PRIORITY_LINK_KEYWORDS) or any(k in text_l for k in PRIORITY_LINK_KEYWORDS):
+            # Deep: more keywords for business sites
+            deep_keywords = PRIORITY_LINK_KEYWORDS + ("services", "menu", "products", "our-work", "portfolio", "locations", "branches", "hours", "open", "about-us", "team", "staff", "contact-us")
+            if any(k in href_l for k in deep_keywords) or any(k in text_l for k in deep_keywords):
                 u = urljoin(base + "/", href)
                 u = self._normalize_full_url(u)
                 if u and self._is_same_site(base, u):
@@ -491,8 +764,8 @@ class WebsiteExtractor:
             for a in soup.find_all("a", href=True):
                 consider(a.get("href", ""), a.get_text(" ", strip=True))
 
-        # De-dupe preserving order
-        return list(dict.fromkeys(candidates))[:12]
+        # De-dupe preserving order, limit but higher for deep
+        return list(dict.fromkeys(candidates))[:20]
 
     def _extract_emails(self, html: str) -> List[str]:
         if not html:

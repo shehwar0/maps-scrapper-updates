@@ -1,1 +1,89 @@
-$env:APP_PORT=5001; .\.venv\Scripts\python.exe backend\app.py
+# Google Maps + Deep Web Lead Scraper - How to Install & Run (Production Ready)
+
+This is a complete guide for installing and running the powerful lead scraper that combines Google Maps scraping with deep website crawling for emails, phones, socials, descriptions, services, etc.
+
+## Prerequisites
+- Python 3.10 or newer recommended
+- Linux, macOS, or Windows
+- Internet connection for first install
+
+## Step-by-Step Installation
+
+1. Open terminal in the project folder.
+
+2. Create and activate virtual environment:
+
+   Linux/macOS:
+   python3 -m venv .venv
+   source .venv/bin/activate
+
+   Windows PowerShell:
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+
+3. Install all dependencies (this includes all performance and power features):
+
+   pip install -r requirements.txt
+
+4. Install Playwright Chromium browser (required for actual scraping power):
+
+   python -m playwright install chromium
+
+   On Linux for headless/production use, also install system packages:
+   sudo apt-get install -y xvfb libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 libasound2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
+
+5. (Optional but recommended) Copy and edit config:
+
+   cp .env.example .env
+
+   Edit .env to tune:
+   - WEB_MAX_PAGES=16
+   - WEB_TIMEOUT_SEC=30
+   etc.
+
+## How to Run
+
+### Option 1: Normal run (with UI)
+source .venv/bin/activate   # activate venv
+python backend/app.py
+
+Then open browser: http://127.0.0.1:5001
+
+### Option 2: Production / Headless run (recommended for long scrapes)
+xvfb-run -a python backend/app.py
+
+Or use the helper:
+chmod +x run_production.sh
+./run_production.sh
+
+### Option 3: With specific port
+APP_PORT=8080 python backend/app.py
+
+## Using the Scraper
+
+- Enter keyword + location
+- Choose mode: Deep (full power), card_only (fast), or dry_run (test mode)
+- Set max results (up to 500+)
+- Start
+- Monitor live results
+- Export CSV (Excel also generated if pandas available)
+- Use Stop button safely
+
+## Running Tests
+PYTHONPATH=backend python tests/test_scraper_power.py
+
+For headless:
+xvfb-run -a python tests/test_scraper_power.py
+
+## Key Powerful Features Now Included
+- Deep Maps scraping without hanging
+- Real website crawling with trafilatura for clean content + Playwright for JS sites
+- Rich data: emails, phones, socials, about, hours, services
+- Smart deduplication with rapidfuzz
+- Fast data handling with pandas (CSV + Excel)
+- Configurable power settings
+- Progress, retries, stealth
+
+This is ready for production use and customer handoff.
+
+For support or customization, refer to the updated README.md.

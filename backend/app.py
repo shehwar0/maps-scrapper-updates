@@ -3,15 +3,23 @@ import concurrent.futures
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from datetime import datetime
-from threading import Event
+from threading import Event, Thread
 from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_file
 import requests
 from url_filters import is_business_website
+
+# Production: load .env for easy config
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass  # optional, env vars still work directly
 
 # Import all scrapers for different modes
 # Ultra Deep - uses ALL engines in parallel with cross-verification
@@ -83,8 +91,10 @@ NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_USER_AGENT = "lead-scraper-location-assistant/1.0"
 LOCATION_SUGGEST_TIMEOUT = 8
 LOCATION_SUGGEST_MAX = 10
-EMAIL_ENRICHMENT_MAX_TARGETS = 160
-EMAIL_ENRICHMENT_WORKERS = 6
+EMAIL_ENRICHMENT_MAX_TARGETS = int(os.getenv("EMAIL_ENRICHMENT_MAX_TARGETS", "160"))
+EMAIL_ENRICHMENT_WORKERS = int(os.getenv("EMAIL_ENRICHMENT_WORKERS", "6"))
+WEB_MAX_PAGES = int(os.getenv("WEB_MAX_PAGES", "16"))
+WEB_TIMEOUT_SEC = int(os.getenv("WEB_TIMEOUT_SEC", "30"))
 
 COUNTRY_ALIASES = {
     "usa": "United States",
@@ -271,7 +281,9 @@ def scrape() -> Dict:
     # Additional options
     deep_search = bool(payload.get("deep_search", True))
     verify_socials = bool(payload.get("verify_socials", True))
-    skip_duplicates = bool(payload.get("skip_duplicates", True))  # NEW: Skip previously scraped
+    skip_duplicates = bool(payload.get("skip_duplicates", True))
+    dry_run = bool(payload.get("dry_run", False))  # Powerful dry-run for tests / safe validation
+    card_only = bool(payload.get("card_only", False))  # Ultra-fast: maps cards only, no website visits
     selected_history_files = _normalize_history_file_selection(payload.get("selected_history_files"))
 
     try:
@@ -323,171 +335,175 @@ def scrape() -> Dict:
     SCRAPE_STATE["location"] = location
     SCRAPE_STATE["running"] = True
     SCRAPE_STATE["status"] = "running"
-    SCRAPE_STATE["message"] = f"🔍 {mode_desc} scraping for '{keyword}' in '{location}'"
+    SCRAPE_STATE["message"] = f"🔍 {mode_desc} scraping for '{keyword}' in '{location}' (background)"
     SCRAPE_STATE["results"] = []
     SCRAPE_STATE["csv_path"] = ""
     STOP_EVENT.clear()
 
-    partial_results: List[Dict[str, str]] = []
+    # Launch scrape in background thread so HTTP request returns immediately.
+    # Frontend relies on /status polling for live updates + final results.
+    def _run_scrape_job():
+        partial_results: List[Dict[str, str]] = []
+        local_excluded = 0
 
-    def report_progress(lead: Dict[str, str]) -> None:
-        if not isinstance(lead, dict):
-            return
+        def report_progress(lead: Dict[str, str]) -> None:
+            if not isinstance(lead, dict):
+                return
+            lead_copy = dict(lead)
+            if exclusion_business_ids and scrape_history:
+                business_id = scrape_history.get_business_id(lead_copy)
+                if business_id and business_id in exclusion_business_ids:
+                    return
+            lead_copy["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead_copy)
+            partial_results.append(lead_copy)
+            SCRAPE_STATE["results"] = partial_results.copy()
+            if STOP_EVENT.is_set():
+                SCRAPE_STATE["message"] = f"Stopping... {len(partial_results)} leads collected so far"
+            else:
+                SCRAPE_STATE["message"] = f"Running... {len(partial_results)} leads collected"
 
-        lead_copy = dict(lead)
-        if exclusion_business_ids and scrape_history:
-            business_id = scrape_history.get_business_id(lead_copy)
-            if business_id and business_id in exclusion_business_ids:
+        scraper = None
+        results: List[Dict[str, str]] = []
+        try:
+            # Choose scraper based on extraction mode
+            if extraction_mode == "ultra":
+                if UltraDeepScraper:
+                    log.info("Using ULTRA DEEP scraper (all engines + cross-verification)")
+                    scraper = UltraDeepScraper(
+                        max_results=max_results,
+                        headless=headless,
+                        website_filter=website_filter,
+                        verify_socials=verify_socials,
+                        skip_duplicates=skip_duplicates,
+                        logger=log,
+                        progress_callback=report_progress,
+                    )
+                else:
+                    log.warning("UltraDeepScraper not available, falling back to Deep")
+            if extraction_mode == "deep" and scraper is None:
+                if DeepBusinessScraper:
+                    log.info("Using DEEP scraper (Maps + Website + Google Search)")
+                    scraper = DeepBusinessScraper(
+                        max_results=max_results,
+                        headless=headless,
+                        website_filter=website_filter,
+                        deep_search=deep_search,
+                        skip_duplicates=skip_duplicates,
+                        dry_run=dry_run,
+                        use_checkpoints=True,
+                        card_only=card_only,
+                        web_max_pages=WEB_MAX_PAGES,
+                        web_timeout_sec=WEB_TIMEOUT_SEC,
+                        logger=log,
+                        progress_callback=report_progress,
+                    )
+                else:
+                    log.warning("DeepBusinessScraper not available, falling back to Enhanced")
+            if extraction_mode == "enhanced" and scraper is None:
+                if EnhancedScraper:
+                    log.info("Using ENHANCED scraper (Maps + Website analysis)")
+                    scraper = EnhancedScraper(
+                        max_results=max_results,
+                        headless=headless,
+                        website_filter=website_filter,
+                        dry_run=dry_run,
+                        logger=log,
+                        progress_callback=report_progress,
+                    )
+                else:
+                    log.warning("EnhancedScraper not available, falling back to Basic")
+            if extraction_mode == "basic" or scraper is None:
+                if BasicScraper:
+                    log.info("Using BASIC scraper (Maps only)")
+                    scraper = BasicScraper(
+                        max_results=max_results,
+                        headless=headless,
+                        website_filter=website_filter,
+                        dry_run=dry_run,
+                        logger=log,
+                        progress_callback=report_progress,
+                    )
+                else:
+                    SCRAPE_STATE["status"] = "error"
+                    SCRAPE_STATE["message"] = "No scraper implementation available"
+                    return
+
+            if scraper is None:
+                SCRAPE_STATE["status"] = "error"
+                SCRAPE_STATE["message"] = "Failed to initialize scraper"
                 return
 
-        lead_copy["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead_copy)
-        partial_results.append(lead_copy)
-        SCRAPE_STATE["results"] = partial_results.copy()
+            raw_results = scraper.scrape(keyword=keyword, location=location, stop_event=STOP_EVENT)
 
-        if STOP_EVENT.is_set():
-            SCRAPE_STATE["message"] = f"Stopping... {len(partial_results)} leads collected so far"
-        else:
-            SCRAPE_STATE["message"] = f"Running... {len(partial_results)} leads collected"
+            if exclusion_business_ids and scrape_history:
+                filtered = []
+                for lead in raw_results or []:
+                    if not isinstance(lead, dict):
+                        filtered.append(lead)
+                        continue
+                    bid = scrape_history.get_business_id(lead)
+                    if bid and bid in exclusion_business_ids:
+                        local_excluded += 1
+                        continue
+                    filtered.append(lead)
+                raw_results = filtered
+                if local_excluded:
+                    log.info("Excluded %d leads using history/selected files", local_excluded)
 
-    try:
-        # Choose scraper based on extraction mode
-        scraper = None
-        
-        if extraction_mode == "ultra":
-            # Ultra Deep - uses ALL engines in parallel with cross-verification
-            if UltraDeepScraper:
-                log.info("Using ULTRA DEEP scraper (all engines + cross-verification)")
-                scraper = UltraDeepScraper(
-                    max_results=max_results,
-                    headless=headless,
-                    website_filter=website_filter,
-                    verify_socials=verify_socials,
-                    skip_duplicates=skip_duplicates,
-                    logger=log,
-                    progress_callback=report_progress,
-                )
-            else:
-                log.warning("UltraDeepScraper not available, falling back to Deep")
-                extraction_mode = "deep"
-        
-        if extraction_mode == "deep" and scraper is None:
-            # Deep - multi-source extraction (Maps + Website + Google Search)
-            if DeepBusinessScraper:
-                log.info("Using DEEP scraper (Maps + Website + Google Search)")
-                scraper = DeepBusinessScraper(
-                    max_results=max_results,
-                    headless=headless,
-                    website_filter=website_filter,
-                    deep_search=deep_search,
-                    skip_duplicates=skip_duplicates,
-                    logger=log,
-                    progress_callback=report_progress,
-                )
-            else:
-                log.warning("DeepBusinessScraper not available, falling back to Enhanced")
-                extraction_mode = "enhanced"
-        
-        if extraction_mode == "enhanced" and scraper is None:
-            # Enhanced - comprehensive extraction
-            if EnhancedScraper:
-                log.info("Using ENHANCED scraper (Maps + Website analysis)")
-                scraper = EnhancedScraper(
-                    max_results=max_results,
-                    headless=headless,
-                    website_filter=website_filter,
-                    logger=log,
-                    progress_callback=report_progress,
-                )
-            else:
-                log.warning("EnhancedScraper not available, falling back to Basic")
-                extraction_mode = "basic"
-        
-        if extraction_mode == "basic" or scraper is None:
-            # Basic - fast Maps-only extraction
-            if BasicScraper:
-                log.info("Using BASIC scraper (Maps only)")
-                scraper = BasicScraper(
-                    max_results=max_results,
-                    headless=headless,
-                    website_filter=website_filter,
-                    logger=log,
-                    progress_callback=report_progress,
-                )
-            else:
-                return jsonify({"error": "No scraper available"}), 500
-        
-        results = scraper.scrape(keyword=keyword, location=location, stop_event=STOP_EVENT)
+            results = _enrich_missing_emails(raw_results or [])
 
-        if exclusion_business_ids and scrape_history:
-            filtered_results = []
             for lead in results:
-                if not isinstance(lead, dict):
-                    filtered_results.append(lead)
-                    continue
-                business_id = scrape_history.get_business_id(lead)
-                if business_id and business_id in exclusion_business_ids:
-                    excluded_by_history += 1
-                    continue
-                filtered_results.append(lead)
-            results = filtered_results
-            if excluded_by_history > 0:
-                log.info("Excluded %d leads using selected/history files", excluded_by_history)
+                if isinstance(lead, dict):
+                    lead["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead)
 
-        # Ensure emails are attempted in every mode without re-crawling every lead.
-        results = _enrich_missing_emails(results)
+            if scrape_history and results:
+                scrape_history.add_batch_to_history(results, keyword, location)
 
-        for lead in results:
-            if isinstance(lead, dict):
-                lead["whatsapp_wa_me_links"] = _build_whatsapp_wa_me_links(lead)
+            SCRAPE_STATE["results"] = results
+            log.info("Scraping completed. Found %d results", len(results))
 
-        if scrape_history and results:
-            scrape_history.add_batch_to_history(results, keyword, location)
+            csv_path = _write_csv(keyword, location, results)
+            SCRAPE_STATE["csv_path"] = csv_path
+            log.info("CSV file written to: %s", csv_path)
 
-        SCRAPE_STATE["results"] = results
-        log.info("Scraping completed. Found %d results", len(results))
-
-        csv_path = _write_csv(keyword, location, results)
-        SCRAPE_STATE["csv_path"] = csv_path
-        log.info("CSV file written to: %s", csv_path)
-
-        if STOP_EVENT.is_set():
-            SCRAPE_STATE["status"] = "stopped"
-            SCRAPE_STATE["message"] = f"Scrape stopped. {len(results)} leads collected"
-        else:
-            SCRAPE_STATE["status"] = "completed"
-            if excluded_by_history > 0:
-                SCRAPE_STATE["message"] = f"Completed. {len(results)} leads collected ({excluded_by_history} skipped from selected/history files)"
+            if STOP_EVENT.is_set():
+                SCRAPE_STATE["status"] = "stopped"
+                SCRAPE_STATE["message"] = f"Scrape stopped. {len(results)} leads collected"
             else:
-                SCRAPE_STATE["message"] = f"Completed. {len(results)} leads collected"
-
-        return jsonify(
-            {
-                "status": SCRAPE_STATE["status"],
-                "message": SCRAPE_STATE["message"],
-                "count": len(results),
-                "results": results,
-                "csv_file": os.path.basename(csv_path),
-                "history_files_used": selected_history_files,
-                "history_skipped": excluded_by_history,
-            }
-        )
-    except CaptchaDetectedError as exc:
-        log.error("Captcha detected: %s", exc)
-        SCRAPE_STATE["status"] = "captcha"
-        SCRAPE_STATE["message"] = "Captcha detected. Automatic bypass is not supported. Run non-headless mode and solve challenge manually."
-        return jsonify({"error": SCRAPE_STATE["message"]}), 429
-    except Exception as exc:
-        if _looks_like_captcha_error(exc):
-            log.error("Captcha-like challenge detected: %s", exc)
+                msg = f"Completed. {len(results)} leads collected"
+                if local_excluded > 0:
+                    msg += f" ({local_excluded} skipped from history/selected files)"
+                SCRAPE_STATE["status"] = "completed"
+                SCRAPE_STATE["message"] = msg
+        except CaptchaDetectedError as exc:
+            log.error("Captcha detected: %s", exc)
             SCRAPE_STATE["status"] = "captcha"
-            SCRAPE_STATE["message"] = "Captcha challenge detected. Automatic bypass is not supported. Run in non-headless mode and solve challenge if prompted."
-            return jsonify({"error": SCRAPE_STATE["message"]}), 429
-        log.exception("Scrape failed: %s", exc)
-        SCRAPE_STATE["status"] = "error"
-        SCRAPE_STATE["message"] = f"Scrape failed: {exc}"
-        return jsonify({"error": SCRAPE_STATE["message"]}), 500
-    finally:
-        SCRAPE_STATE["running"] = False
+            SCRAPE_STATE["message"] = "Captcha detected. Run non-headless and solve manually."
+        except Exception as exc:
+            if _looks_like_captcha_error(exc):
+                log.error("Captcha-like challenge: %s", exc)
+                SCRAPE_STATE["status"] = "captcha"
+                SCRAPE_STATE["message"] = "Captcha challenge. Run non-headless to solve if shown."
+            else:
+                log.exception("Scrape job failed: %s", exc)
+                SCRAPE_STATE["status"] = "error"
+                SCRAPE_STATE["message"] = f"Scrape failed: {exc}"
+        finally:
+            SCRAPE_STATE["running"] = False
+
+    # Start background job (daemon so it doesn't prevent shutdown)
+    job_thread = Thread(target=_run_scrape_job, name="scrape-job", daemon=True)
+    job_thread.start()
+
+    # Return immediately so client doesn't block on long-running scrape
+    return jsonify(
+        {
+            "status": "started",
+            "message": f"Scrape started in background for '{keyword}' in '{location}'. Use /status to monitor.",
+            "count": 0,
+            "results": [],
+        }
+    )
 
 
 @app.get("/download")
@@ -533,18 +549,80 @@ def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
     log.info("Writing CSV to: %s", path)
     log.info("Number of leads to write: %d", len(leads))
 
-    # Enhanced CSV with all extracted fields including verification data
+    # Enhanced CSV with all extracted fields + very powerful web data
     fieldnames = [
         "Name", "Phone", "Email", "All Emails", "WhatsApp", "All WhatsApp",
+        "All Phones from Web",
         "WhatsApp wa.me Links",
         "Website", "Has Website", "Address", "Rating", "Reviews",
         "Category", "Business Hours",
         "Instagram", "Facebook", "Twitter", "LinkedIn", "TikTok", "YouTube",
         "Has Chatbot", "Chatbot Type", "Has Google Analytics", "Has Meta Pixel",
         "CMS Platform", "Is Automated", "Quality Score", "Verification Score",
-        "Data Sources", "Google Maps URL"
+        "Data Sources", "Google Maps URL",
+        "Web Description", "Web Services", "Web Address", "Pages Crawled on Web", "Structured Data on Web", "Web About", "Web Hours"
     ]
 
+    # Use pandas for powerful data handling when available (faster, more features, Excel support)
+    if PANDAS_AVAILABLE and len(leads) > 0:
+        try:
+            df = pd.DataFrame([
+                {
+                    "Name": lead.get("name", ""),
+                    "Phone": lead.get("phone", ""),
+                    "Email": lead.get("email", ""),
+                    "All Emails": lead.get("all_emails", ""),
+                    "WhatsApp": lead.get("whatsapp", ""),
+                    "All WhatsApp": lead.get("all_whatsapp", ""),
+                    "WhatsApp wa.me Links": _build_whatsapp_wa_me_links(lead),
+                    "Website": lead.get("website", ""),
+                    "Has Website": lead.get("has_website", ""),
+                    "Address": lead.get("address", ""),
+                    "Rating": lead.get("rating", ""),
+                    "Reviews": lead.get("review_count", ""),
+                    "Category": lead.get("category", ""),
+                    "Business Hours": lead.get("business_hours", ""),
+                    "Instagram": lead.get("instagram", ""),
+                    "Facebook": lead.get("facebook", ""),
+                    "Twitter": lead.get("twitter", ""),
+                    "LinkedIn": lead.get("linkedin", ""),
+                    "TikTok": lead.get("tiktok", ""),
+                    "YouTube": lead.get("youtube", ""),
+                    "Has Chatbot": lead.get("has_chatbot", ""),
+                    "Chatbot Type": lead.get("chatbot_type", ""),
+                    "Has Google Analytics": lead.get("has_google_analytics", ""),
+                    "Has Meta Pixel": lead.get("has_meta_pixel", ""),
+                    "CMS Platform": lead.get("cms_platform", ""),
+                    "Is Automated": lead.get("is_automated", ""),
+                    "Quality Score": lead.get("quality_score", ""),
+                    "Verification Score": lead.get("verification_score", ""),
+                    "Data Sources": lead.get("data_sources", ""),
+                    "Google Maps URL": lead.get("google_maps_url", ""),
+                    "Web Description": lead.get("web_description", ""),
+                    "Web Services": lead.get("web_services", ""),
+                    "Web Address": lead.get("web_address", ""),
+                    "All Phones from Web": lead.get("all_phones", "") or lead.get("all_phones_from_web", ""),
+                    "Pages Crawled on Web": lead.get("pages_crawled_on_web", ""),
+                    "Structured Data on Web": lead.get("structured_data_on_web", ""),
+                    "Web About": lead.get("web_about", ""),
+                    "Web Hours": lead.get("web_hours", ""),
+                }
+                for lead in leads
+            ])
+            df.to_csv(path, index=False)
+            # Bonus: also save Excel for power users
+            excel_path = path.replace(".csv", ".xlsx")
+            try:
+                df.to_excel(excel_path, index=False, engine="openpyxl" if "openpyxl" in str(pd.__version__) else None)
+                log.info("Also wrote powerful Excel: %s", excel_path)
+            except Exception:
+                pass  # openpyxl may not be installed
+            log.info("Powerful pandas CSV written: %s", path)
+            return path
+        except Exception as e:
+            log.warning("Pandas export failed, falling back to csv: %s", e)
+    
+    # Standard CSV fallback
     try:
         with open(path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -582,6 +660,14 @@ def _write_csv(keyword: str, location: str, leads: List[Dict[str, str]]) -> str:
                         "Verification Score": lead.get("verification_score", ""),
                         "Data Sources": lead.get("data_sources", ""),
                         "Google Maps URL": lead.get("google_maps_url", ""),
+                        "Web Description": lead.get("web_description", ""),
+                        "Web Services": lead.get("web_services", ""),
+                        "Web Address": lead.get("web_address", ""),
+                        "All Phones from Web": lead.get("all_phones", "") or lead.get("all_phones_from_web", ""),
+                        "Pages Crawled on Web": lead.get("pages_crawled_on_web", ""),
+                        "Structured Data on Web": lead.get("structured_data_on_web", ""),
+                        "Web About": lead.get("web_about", ""),
+                        "Web Hours": lead.get("web_hours", ""),
                     }
                 )
         log.info("CSV file successfully written: %s", path)
@@ -889,20 +975,25 @@ def _enrich_missing_emails(results: List[Dict[str, str]]) -> List[Dict[str, str]
             return None
 
         try:
-            extractor = WebsiteExtractor(timeout=8)
+            extractor = WebsiteExtractor(timeout=10)
             enriched = extractor.enrich(
                 website,
                 fallback_phone=fallback_phone,
-                max_pages=5,
-                max_total_time_sec=12,
-                priority_only=True,
+                max_pages=12,
+                max_total_time_sec=18,
+                priority_only=False,
+                use_playwright=True,
             )
             return host_key, {
                 "email": str(enriched.get("email") or "").strip(),
                 "whatsapp": str(enriched.get("whatsapp") or "").strip(),
+                "all_emails": str(enriched.get("all_emails") or "").strip(),
+                "all_phones": str(enriched.get("all_phones") or "").strip(),
+                "socials": enriched.get("socials") or {},
+                "web_description": str(enriched.get("description") or "").strip(),
             }
         except Exception as exc:
-            log.debug("Email backfill failed for %s: %s", website, exc)
+            log.debug("Powerful web backfill failed for %s: %s", website, exc)
             return host_key, {"email": "", "whatsapp": ""}
 
     max_workers = max(1, min(EMAIL_ENRICHMENT_WORKERS, len(website_targets)))

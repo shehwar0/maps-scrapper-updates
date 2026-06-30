@@ -27,6 +27,25 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from email_extractor import WebsiteExtractor
 from maps_city_coverage import build_citywide_queries
 from url_filters import is_business_website, normalize_business_website
+from scraper_utils import (
+    apply_stealth, block_heavy_resources, robust_scroll_to_end,
+    extract_card_data, get_card_data_batch, CardData, apply_card_to_lead,
+    create_dry_run_leads, save_checkpoint, load_latest_checkpoint, safe_launch_browser
+)
+
+# Production UA rotation (if available)
+try:
+    from fake_useragent import UserAgent
+    _UA = UserAgent()
+except Exception:
+    _UA = None
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except Exception:
+    TQDM_AVAILABLE = False
+    tqdm = None
 
 
 # ============================================================================
@@ -36,9 +55,13 @@ from url_filters import is_business_website, normalize_business_website
 MAX_RESULTS_CAP = 500
 RESULT_SCAN_WINDOW = 320
 CITYWIDE_QUERY_LIMIT = 30
-MAP_STAGNANT_ROUNDS = 22
-MAP_SCROLL_DELAY_MIN = 0.28
-MAP_SCROLL_DELAY_MAX = 0.55
+MAP_STAGNANT_ROUNDS = 28
+MAP_SCROLL_DELAY_MIN = 0.25
+MAP_SCROLL_DELAY_MAX = 0.65  # tuned for best balance of speed + reliability for 100+ results
+# Overall time budget for discovering URLs (prevents hang on hard queries)
+URL_DISCOVERY_MAX_SEC = 240  # 4 minutes max for collecting place links
+LISTING_MAX_SEC_PER_ITEM = 55  # hard safety per business detail page + enrich
+DISCOVERY_STABLE_ROUNDS_FOR_END = 4  # if no new after this many + end markers => stop
 REQUEST_TIMEOUT = 15
 QUERY_RETRY_ATTEMPTS = 2
 QUERY_RETRY_BASE_WAIT_MS = 2500
@@ -54,10 +77,10 @@ CAPTCHA_MARKERS = (
     "our systems have detected unusual traffic",
     "sorry/index",
 )
-LISTING_TIME_BUDGET_SEC = 70
-WEBSITE_ANALYSIS_BUDGET_SEC = 25
-HEAVY_STEP_MIN_REMAINING_SEC = 12
-GOOGLE_LOOKUP_MIN_REMAINING_SEC = 12
+LISTING_TIME_BUDGET_SEC = 55
+WEBSITE_ANALYSIS_BUDGET_SEC = 16
+HEAVY_STEP_MIN_REMAINING_SEC = 8
+GOOGLE_LOOKUP_MIN_REMAINING_SEC = 8
 
 # Pages to check for contact info on websites
 CONTACT_PAGES = [
@@ -241,6 +264,15 @@ class BusinessData:
     whatsapp_numbers: List[str] = field(default_factory=list)
     additional_phones: List[str] = field(default_factory=list)
 
+    # DEEP powerful web data
+    web_description: str = ""
+    web_address: str = ""
+    web_services: str = ""
+    pages_crawled_on_web: int = 0
+    structured_data_on_web: bool = False
+    web_about: str = ""
+    web_hours: str = ""
+
     # Social Media
     instagram: str = ""
     facebook: str = ""
@@ -291,6 +323,14 @@ class BusinessData:
             "is_automated": "Yes" if self.is_automated else "No",
             "quality_score": self.extraction_quality,
             "google_maps_url": self.google_maps_url,
+            # Powerful web extra
+            "web_description": self.web_description,
+            "web_services": self.web_services,
+            "web_address": self.web_address,
+            "pages_crawled_on_web": self.pages_crawled_on_web,
+            "structured_data_on_web": "Yes" if self.structured_data_on_web else "No",
+            "web_about": self.web_about,
+            "web_hours": self.web_hours,
         }
 
     def calculate_quality(self) -> str:
@@ -617,7 +657,12 @@ class DeepBusinessScraper:
         max_delay: float = 1.6,
         website_filter: str = "all",
         deep_search: bool = True,
-        skip_duplicates: bool = True,  # NEW: Skip previously scraped businesses
+        skip_duplicates: bool = True,
+        dry_run: bool = False,
+        use_checkpoints: bool = True,
+        card_only: bool = False,
+        web_max_pages: int = 16,
+        web_timeout_sec: int = 30,
         logger: Optional[logging.Logger] = None,
         progress_callback: Optional[Callable[[Dict[str, str]], None]] = None,
     ) -> None:
@@ -628,10 +673,18 @@ class DeepBusinessScraper:
         self.website_filter = website_filter if website_filter in {"all", "with", "without"} else "all"
         self.deep_search = deep_search
         self.skip_duplicates = skip_duplicates
+        self.dry_run = dry_run
+        self.use_checkpoints = use_checkpoints
+        self.card_only = card_only
         self.log = logger or logging.getLogger(__name__)
         self.progress_callback = progress_callback
         self._website_cache: Dict[str, Dict] = {}
         self._google_cache: Dict[str, Optional[Dict]] = {}
+        self._card_cache: Dict[str, CardData] = {}
+
+        # Production config for web depth (configurable for prod tuning)
+        self.web_max_pages = web_max_pages
+        self.web_timeout_sec = web_timeout_sec
         
         # Initialize history manager for deduplication
         try:
@@ -657,85 +710,142 @@ class DeepBusinessScraper:
         location: str,
         stop_event: Optional[Event] = None,
     ) -> List[Dict[str, str]]:
-        """Main scrape method with deduplication."""
+        """Main scrape method. Now with dry_run, hybrid card extraction, stealth, checkpoints."""
         stop_event = stop_event or Event()
-        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
 
+        if self.dry_run:
+            self.log.info("🧪 DRY RUN MODE - generating synthetic data (no browser)")
+            leads = create_dry_run_leads(keyword, location, self.max_results)
+            if self.progress_callback:
+                for l in leads:
+                    try:
+                        self.progress_callback(l)
+                    except Exception:
+                        pass
+            return leads
+
+        search_queries = build_citywide_queries(keyword, location, max_queries=CITYWIDE_QUERY_LIMIT)
         if not search_queries:
             return []
 
-        duplicate_buffer = 0
+        duplicate_buffer = min(18, max(3, self.max_results // 7))
         if self.skip_duplicates:
-            duplicate_buffer = min(12, max(2, self.max_results // 12))
+            duplicate_buffer = max(duplicate_buffer, 8)
         target_urls = self.max_results + duplicate_buffer
-        
-        # Log history stats
+
+        # Resume from checkpoint if available
+        discovered: List[str] = []
+        seen: Set[str] = set()
+        checkpoint = None
+        if self.use_checkpoints:
+            checkpoint = load_latest_checkpoint(keyword, location)
+            if checkpoint and checkpoint.get("keyword") == keyword and checkpoint.get("location") == location:
+                discovered = checkpoint.get("discovered_urls", [])[:target_urls]
+                seen = set(discovered)
+                self.log.info("♻️ Resuming from checkpoint with %d urls", len(discovered))
+
         if self.skip_duplicates and self.history:
             stats = self.history.get_stats(keyword, location)
-            self.log.info(f"📊 History: {stats.get('search_total', 0)} previously scraped for this search")
+            self.log.info(f"📊 History: {stats.get('search_total', 0)} previously scraped")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1400, "height": 1000},
-            )
-            
-            try:
-                # Main page for Maps navigation
-                page = context.new_page()
+            browser, context = safe_launch_browser(p, headless=self.headless, logger=self.log)
+            page = context.new_page()
+            apply_stealth(page)
+            block_heavy_resources(page)
 
+            try:
                 if len(search_queries) > 1:
                     self.log.info("Using %d map zones for broader city coverage", len(search_queries))
 
-                discovered: List[str] = []
-                seen: Set[str] = set()
                 per_query_target = max(10, (target_urls + len(search_queries) - 1) // len(search_queries))
 
                 for query in search_queries:
                     if stop_event.is_set() or len(discovered) >= target_urls:
                         break
-
                     remaining = target_urls - len(discovered)
-                    query_target = min(per_query_target, remaining)
-                    place_urls = self._search_query_with_retries(page, query, stop_event, query_target)
-
-                    for place_url in place_urls:
-                        if place_url and place_url not in seen:
-                            seen.add(place_url)
-                            discovered.append(place_url)
+                    qtarget = min(per_query_target, remaining)
+                    place_urls = self._search_query_with_retries(page, query, stop_event, qtarget)
+                    for u in place_urls:
+                        if u and u not in seen:
+                            seen.add(u)
+                            discovered.append(u)
                             if len(discovered) >= target_urls:
                                 break
 
                 if len(discovered) < target_urls and not stop_event.is_set():
-                    remaining = target_urls - len(discovered)
-                    fallback_urls = self._search_query_with_retries(
-                        page,
-                        search_queries[0],
-                        stop_event,
-                        remaining,
-                    )
-                    for place_url in fallback_urls:
-                        if place_url and place_url not in seen:
-                            seen.add(place_url)
-                            discovered.append(place_url)
+                    rem = target_urls - len(discovered)
+                    fb = self._search_query_with_retries(page, search_queries[0], stop_event, rem)
+                    for u in fb:
+                        if u and u not in seen:
+                            seen.add(u)
+                            discovered.append(u)
                             if len(discovered) >= target_urls:
                                 break
 
+                # Powerful hybrid: batch extract card data first (no full visits)
+                self._card_cache = get_card_data_batch(page, discovered)
+                self.log.info("🃏 Pre-extracted rich card data for %d listings (huge perf win)", len(self._card_cache))
+
+                if self.card_only:
+                    # Ultra fast power mode: pure card data, no place visits or website crawls at all
+                    self.log.info("⚡ CARD_ONLY fast mode - skipping all place visits and web enrichment")
+                    results = []
+                    for url in discovered[:target_urls]:
+                        cd = self._card_cache.get(url) or CardData(url=url)
+                        lead = {
+                            "name": cd.name or "Unknown Business",
+                            "phone": "",
+                            "email": "",
+                            "website": "",
+                            "whatsapp": "",
+                            "google_maps_url": url,
+                            "has_website": "No",
+                            "address": cd.address,
+                            "rating": cd.rating,
+                            "review_count": cd.review_count,
+                            "category": cd.category or keyword,
+                            "business_hours": "",
+                            "instagram": "",
+                            "facebook": "",
+                            "twitter": "",
+                            "linkedin": "",
+                            "tiktok": "",
+                            "youtube": "",
+                            "has_chatbot": "No",
+                            "chatbot_type": "",
+                            "has_google_analytics": "No",
+                            "has_meta_pixel": "No",
+                            "cms_platform": "",
+                            "is_automated": "No",
+                            "quality_score": "card-only",
+                            "data_sources": "maps_cards",
+                            "all_emails": "",
+                            "all_whatsapp": "",
+                        }
+                        results.append(lead)
+                        if self.progress_callback:
+                            try:
+                                self.progress_callback(lead)
+                            except Exception:
+                                pass
+                    if self.skip_duplicates and self.history and results:
+                        self.history.add_batch_to_history(results, keyword, location)
+                    if self.use_checkpoints:
+                        save_checkpoint(keyword, location, discovered, results, len(results))
+                    return results
+
                 leads = self._collect_lead_details(context, discovered[:target_urls], keyword, location, stop_event)
-                
-                # Convert to dicts
+
                 results = [lead.to_dict() for lead in leads]
-                
-                # Add new results to history
+
                 if self.skip_duplicates and self.history and results:
                     self.history.add_batch_to_history(results, keyword, location)
-                    self.log.info(f"💾 Saved {len(results)} new businesses to history")
-                
+                    self.log.info(f"💾 Saved {len(results)} to history")
+
+                if self.use_checkpoints and len(discovered) > 5:
+                    save_checkpoint(keyword, location, discovered, results, len(results))
+
                 return results
             finally:
                 context.close()
@@ -778,29 +888,47 @@ class DeepBusinessScraper:
         raise RuntimeError(f"Search failed for query: {query}")
 
     def _open_and_search(self, page: Page, query: str) -> None:
-        """Navigate to Google Maps and search."""
+        """Navigate + search with multiple strategies and stronger waits."""
         encoded_query = quote_plus(query)
-        page.goto(f"https://www.google.com/maps/search/{encoded_query}", timeout=90000)
-        page.wait_for_timeout(1500)
+        try:
+            page.goto(f"https://www.google.com/maps/search/{encoded_query}", timeout=75000, wait_until="domcontentloaded")
+        except Exception:
+            page.goto("https://www.google.com/maps", timeout=30000)
+            self._human_delay(0.4, 0.9)
+
+        page.wait_for_timeout(1100)
         self._maybe_accept_consent(page)
         self._raise_if_captcha(page)
 
-        if self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc"], timeout_ms=45000):
-            self._human_delay()
+        # Stronger initial wait: wait for feed or results
+        if self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc"], timeout_ms=38000):
+            # Give a bit for first batch render
+            page.wait_for_timeout(650)
+            self._human_delay(0.2, 0.5)
             return
 
+        # Fallback to classic search box
         search_input = self._find_search_input(page)
         if search_input:
-            search_input.fill(query)
-            self._human_delay()
-            search_input.press("Enter")
+            try:
+                search_input.fill("")
+                search_input.fill(query)
+                self._human_delay(0.2, 0.5)
+                search_input.press("Enter")
+            except Exception:
+                pass
 
-        if not self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc", "h1.DUwDvf"], timeout_ms=45000):
-            raise RuntimeError(
-                "Google Maps results did not load. Check network or try again."
-            )
+        if not self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc", "h1.DUwDvf"], timeout_ms=42000):
+            # Last attempt: try direct place search variation or reload
+            try:
+                page.reload(timeout=20000)
+                page.wait_for_timeout(900)
+            except Exception:
+                pass
+            if not self._wait_for_any(page, ["div[role='feed']", "a.hfpxzc"], timeout_ms=18000):
+                raise RuntimeError("Google Maps results did not load (UI change / slow net / captcha).")
 
-        self._human_delay()
+        self._human_delay(0.3, 0.7)
         self._raise_if_captcha(page)
 
     def _find_search_input(self, page: Page):
@@ -822,16 +950,24 @@ class DeepBusinessScraper:
         return None
 
     def _wait_for_any(self, page: Page, selectors: List[str], timeout_ms: int) -> bool:
-        """Wait for any selector to appear."""
+        """Wait for any selector with progressive polling."""
         deadline = time.time() + (timeout_ms / 1000)
+        poll = 280
         while time.time() < deadline:
             for selector in selectors:
                 try:
-                    if page.locator(selector).first.count() > 0:
-                        return True
+                    loc = page.locator(selector).first
+                    if loc.count() > 0:
+                        # Verify visible-ish
+                        try:
+                            if loc.is_visible():
+                                return True
+                        except Exception:
+                            return True
                 except Exception:
                     continue
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(poll)
+            poll = min(620, int(poll * 1.1))
         return False
 
     def _maybe_accept_consent(self, page: Page) -> None:
@@ -852,77 +988,85 @@ class DeepBusinessScraper:
             except Exception:
                 continue
 
+    def _is_end_of_results(self, page: Page) -> bool:
+        """Detect Google Maps 'end of list' state to stop scrolling reliably."""
+        try:
+            # Quick content scan for common end markers (Google localized variations exist)
+            try:
+                content = (page.content() or "").lower()
+            except Exception:
+                content = ""
+            end_markers = (
+                "you've reached the end",
+                "end of the list",
+                "no more results",
+                "all results shown",
+                "reached the end",
+                "no other results",
+            )
+            if any(m in content for m in end_markers):
+                return True
+
+            # Status / info banners
+            for sel in [
+                "div[role='status']",
+                "[aria-label*='end']",
+                "div.n7lv7yjy",
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        txt = (el.inner_text(timeout=600) or "").lower()
+                        if any(m in txt for m in ("end", "no more", "limited", "results")):
+                            return True
+                except Exception:
+                    continue
+
+            # If feed height stopped growing significantly for a while, secondary signal
+            # (caller tracks stable rounds)
+            return False
+        except Exception:
+            return False
+
     def _collect_place_urls(self, page: Page, stop_event: Event, target_count: Optional[int] = None) -> List[str]:
-        """Collect place URLs from Maps results - scrolls deeper when deduplication is enabled."""
-        discovered: List[str] = []
-        seen: Set[str] = set()
-        stagnant_rounds = 0
-        max_stagnant_rounds = MAP_STAGNANT_ROUNDS + (4 if self.skip_duplicates else 0)
-        
+        """Delegates to ultra-robust scroller from scraper_utils (stealth + smart end detect + human timing)."""
         if target_count is None:
-            duplicate_buffer = 0
+            duplicate_buffer = min(20, max(3, self.max_results // 7))
             if self.skip_duplicates:
-                duplicate_buffer = min(12, max(2, self.max_results // 12))
+                duplicate_buffer = max(duplicate_buffer, 8)
             target_urls = self.max_results + duplicate_buffer
         else:
             target_urls = max(1, target_count)
 
-        current_url = page.url or ""
-        if "/maps/place/" in current_url:
-            return [current_url]
+        if "/maps/place/" in (page.url or ""):
+            return [page.url][:target_urls]
 
-        while len(discovered) < target_urls and stagnant_rounds < max_stagnant_rounds and not stop_event.is_set():
-            before = len(discovered)
-            
-            try:
-                hrefs = page.eval_on_selector_all(
-                    "a.hfpxzc",
-                    "els => els.map(el => el.getAttribute('href') || el.href || '').filter(Boolean)",
-                )
-            except Exception:
-                hrefs = []
+        apply_stealth(page)
+        block_heavy_resources(page)
 
-            if hrefs:
-                tail_start = max(0, len(hrefs) - RESULT_SCAN_WINDOW)
-                for href in hrefs[tail_start:]:
-                    if stop_event.is_set() or len(discovered) >= target_urls:
+        final_count, reached_end = robust_scroll_to_end(
+            page, stop_event, target_urls, max_scrolls=75, logger=self.log
+        )
+
+        # Collect the URLs after robust scroll
+        discovered: List[str] = []
+        seen: Set[str] = set()
+        try:
+            hrefs = page.eval_on_selector_all(
+                "a.hfpxzc",
+                "els => els.map(el => el.getAttribute('href') || el.href || '').filter(Boolean)",
+            )
+            for h in hrefs:
+                if h and h not in seen:
+                    seen.add(h)
+                    discovered.append(h)
+                    if len(discovered) >= target_urls:
                         break
-                    if href and href not in seen:
-                        seen.add(href)
-                        discovered.append(href)
-            else:
-                links = page.locator("a.hfpxzc")
-                count = links.count()
-                start_idx = max(0, count - RESULT_SCAN_WINDOW)
+        except Exception:
+            pass
 
-                for idx in range(start_idx, count):
-                    if stop_event.is_set() or len(discovered) >= target_urls:
-                        break
-                    try:
-                        href = links.nth(idx).get_attribute("href") or ""
-                        if href and href not in seen:
-                            seen.add(href)
-                            discovered.append(href)
-                    except PlaywrightTimeoutError:
-                        continue
-
-            if len(discovered) == before:
-                stagnant_rounds += 1
-            else:
-                stagnant_rounds = 0
-
-            # Scroll
-            feed = page.locator("div[role='feed']").first
-            try:
-                feed.evaluate("el => el.scrollBy(0, el.scrollHeight)")
-            except Exception:
-                page.mouse.wheel(0, 4000)
-
-            self._human_delay(MAP_SCROLL_DELAY_MIN, MAP_SCROLL_DELAY_MAX)
-            self._raise_if_captcha(page)
-
-        self.log.info("📍 Discovered %d place URLs (target %d)", len(discovered), self.max_results)
-        return discovered
+        self.log.info("📍 Discovered %d place URLs (robust, end_detected=%s)", len(discovered), reached_end)
+        return discovered[:target_urls]
 
     def _collect_lead_details(
         self,
@@ -932,61 +1076,85 @@ class DeepBusinessScraper:
         location: str,
         stop_event: Event,
     ) -> List[BusinessData]:
-        """Extract detailed data from each listing with deduplication."""
+        """Hybrid: use pre-extracted card data + visit only when needed. Reuses page. Extremely efficient."""
         leads: List[BusinessData] = []
         skipped_duplicates = 0
         processed = 0
+        detail_page = None
 
-        for index, place_url in enumerate(place_urls, start=1):
-            if stop_event.is_set():
-                self.log.info("Stop requested. Ending early.")
-                break
-            
-            # Stop if we have enough NEW results
-            if len(leads) >= self.max_results:
+        try:
+            detail_page = context.new_page()
+            apply_stealth(detail_page)
+            block_heavy_resources(detail_page)
+        except Exception:
+            detail_page = None
+
+        iterator = tqdm(place_urls, desc="Deep scraping leads", unit="lead") if TQDM_AVAILABLE else place_urls
+        for index, place_url in enumerate(iterator, start=1):
+            if stop_event.is_set() or len(leads) >= self.max_results:
                 break
 
             processed += 1
-            self.log.info(
-                "🔍 Processing candidate %d (Collected: %d/%d, Skipped: %d duplicates)",
-                processed,
-                len(leads),
-                self.max_results,
-                skipped_duplicates,
-            )
+            if not TQDM_AVAILABLE:
+                self.log.info("🔍 %d/%d (new:%d skip:%d)", processed, len(place_urls), len(leads), skipped_duplicates)
 
-            page = context.new_page()
+            page_to_use = detail_page or context.new_page()
             try:
-                lead = self._extract_full_listing(page, place_url, keyword, location)
+                lead = self._extract_full_listing(page_to_use, place_url, keyword, location, max_time=LISTING_MAX_SEC_PER_ITEM)
+
+                # Merge any card data we pre-extracted (huge win - name/rating/address often complete)
+                card = self._card_cache.get(place_url)
+                if card and lead:
+                    apply_card_to_lead(lead.to_dict(), card)  # will merge into lead attrs below if needed
+                    if not lead.name and card.name:
+                        lead.name = card.name
+                    if not lead.address and card.address:
+                        lead.address = card.address
+                    if lead.rating == 0 and card.rating:
+                        lead.rating = card.rating
+                    if lead.review_count == 0 and card.review_count:
+                        lead.review_count = card.review_count
+                    if not lead.category and card.category:
+                        lead.category = card.category
+
                 if lead:
-                    # Check for duplicates BEFORE applying other filters
                     if self.skip_duplicates and self.history:
-                        lead_dict = lead.to_dict()
-                        if self.history.is_duplicate(lead_dict, keyword, location):
+                        if self.history.is_duplicate(lead.to_dict(), keyword, location):
                             skipped_duplicates += 1
-                            self.log.info("⏭️ Skipping duplicate: %s", lead.name)
                             continue
-                    
                     if self._passes_website_filter(lead.website):
                         lead.extraction_quality = lead.calculate_quality()
                         leads.append(lead)
-                        self.log.info("✓ NEW: %s (Quality: %s)", lead.name, lead.extraction_quality)
                         if self.progress_callback:
                             try:
                                 self.progress_callback(lead.to_dict())
                             except Exception:
-                                # Progress callbacks should never interrupt scraping.
                                 pass
             except CaptchaDetectedError:
                 raise
             except Exception as e:
-                self.log.error("Failed to extract %s: %s", place_url, e)
+                self.log.warning("Lead extract error %s: %s", place_url[:60], str(e)[:80])
+                if detail_page:
+                    try:
+                        detail_page.goto("https://www.google.com/maps", timeout=10000)
+                    except Exception:
+                        pass
             finally:
-                page.close()
+                if page_to_use is not detail_page:
+                    try:
+                        page_to_use.close()
+                    except Exception:
+                        pass
 
-            self._human_delay(0.2, 0.5)
-        
-        self.log.info(f"📊 Summary: {len(leads)} new businesses, {skipped_duplicates} duplicates skipped")
+            self._human_delay(0.1, 0.35)
+
+        if detail_page:
+            try:
+                detail_page.close()
+            except Exception:
+                pass
+
+        self.log.info("📊 %d collected, %d dups skipped (hybrid card+page)", len(leads), skipped_duplicates)
         return leads
 
     def _passes_website_filter(self, website: str) -> bool:
@@ -1004,13 +1172,20 @@ class DeepBusinessScraper:
         place_url: str,
         keyword: str,
         location: str,
+        max_time: float = LISTING_MAX_SEC_PER_ITEM,
     ) -> Optional[BusinessData]:
-        """Extract comprehensive data from a single listing."""
+        """Extract data from single listing. Respects max_time budget."""
+        start_time = time.time()
+
+        def _budget_ok(extra: float = 0) -> bool:
+            return (time.time() - start_time) < (max_time - extra)
+
         for attempt in range(2):
             try:
-                start_time = time.time()
-                page.goto(place_url, timeout=60000)
-                page.wait_for_timeout(1800)
+                if attempt > 0:
+                    start_time = time.time()  # reset for retry budget
+                page.goto(place_url, timeout=42000)
+                page.wait_for_timeout(900)
                 self._raise_if_captcha(page)
 
                 data = BusinessData()
@@ -1033,24 +1208,27 @@ class DeepBusinessScraper:
                 data.facebook = gmaps_socials.get("facebook", "")
                 data.twitter = gmaps_socials.get("twitter", "")
 
-                # ===== STEP 2: Analyze website if available =====
-                if data.website:
+                # ===== STEP 2: Analyze website if available (respect budget) =====
+                if data.website and _budget_ok(12):
                     cache_key = self._website_cache_key(data.website)
                     website_data = self._website_cache.get(cache_key)
                     if website_data is None:
-                        remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                        remaining = max(6, max_time - (time.time() - start_time))
                         if remaining >= HEAVY_STEP_MIN_REMAINING_SEC:
-                            website_data = self._deep_analyze_website(
-                                page,
-                                data.website,
-                                max_total_time_sec=min(WEBSITE_ANALYSIS_BUDGET_SEC, max(10, int(remaining))),
-                            )
-                            self._website_cache[cache_key] = dict(website_data)
-                    # Merge website data
-                    if website_data is not None:
+                            try:
+                                website_data = self._deep_analyze_website(
+                                    page,
+                                    data.website,
+                                    max_total_time_sec=min(WEBSITE_ANALYSIS_BUDGET_SEC, int(remaining)),
+                                )
+                                self._website_cache[cache_key] = dict(website_data)
+                            except Exception as we:
+                                self.log.warning("Web analysis error for %s: %s", data.website, we)
+                                website_data = {}
+                    if website_data:
                         data.data_sources.append("website")
-                        data.emails = website_data.get("emails", [])
-                        data.whatsapp_numbers = website_data.get("whatsapp_numbers", [])
+                        data.emails = website_data.get("emails", []) or []
+                        data.whatsapp_numbers = website_data.get("whatsapp_numbers", []) or []
                         
                         socials = website_data.get("socials", {})
                         if not data.instagram and socials.get("instagram"):
@@ -1073,10 +1251,22 @@ class DeepBusinessScraper:
                         data.cms_platform = website_data.get("cms_platform", "")
                         data.is_automated = data.has_chatbot
 
-                # ===== STEP 3: Google search for additional info =====
+                        # Store DEEP powerful web data
+                        data.web_description = website_data.get("web_description", "")
+                        data.web_services = website_data.get("web_services", "")
+                        data.web_address = website_data.get("web_address", "")
+                        data.pages_crawled_on_web = website_data.get("pages_crawled", 0)
+                        data.structured_data_on_web = website_data.get("structured_data_found", False)
+                        data.web_about = website_data.get("web_about", "")
+                        data.web_hours = website_data.get("web_hours", "")
+                        if website_data.get("all_phones_from_web"):
+                            data.additional_phones = [p for p in website_data["all_phones_from_web"].split("; ") if p][:5]
+
+                # ===== STEP 3: Google search for additional info (only if time) =====
                 needs_google_lookup = (
                     self.deep_search
                     and data.name
+                    and _budget_ok(8)
                     and (
                         not data.instagram
                         or not data.facebook
@@ -1085,7 +1275,7 @@ class DeepBusinessScraper:
                     )
                 )
                 if needs_google_lookup:
-                    remaining = LISTING_TIME_BUDGET_SEC - (time.time() - start_time)
+                    remaining = max_time - (time.time() - start_time)
                     if remaining < GOOGLE_LOOKUP_MIN_REMAINING_SEC:
                         needs_google_lookup = False
 
@@ -1096,8 +1286,6 @@ class DeepBusinessScraper:
                     google_data = self._google_cache.get(google_key)
                     if google_data:
                         data.data_sources.append("google_search")
-                        
-                        # Fill in missing data
                         if not data.instagram and google_data.get("instagram"):
                             data.instagram = google_data["instagram"]
                         if not data.facebook and google_data.get("facebook"):
@@ -1107,7 +1295,7 @@ class DeepBusinessScraper:
                         if not data.emails and google_data.get("email"):
                             data.emails = [google_data["email"]]
 
-                # ===== STEP 4: Use phone as WhatsApp fallback =====
+                # ===== STEP 4: phone fallback =====
                 if not data.whatsapp_numbers and data.phone:
                     normalized = normalize_phone(data.phone)
                     if normalized:
@@ -1119,7 +1307,10 @@ class DeepBusinessScraper:
                 raise
             except Exception as exc:
                 self.log.warning("Attempt %d failed for %s: %s", attempt + 1, place_url, exc)
-                self._human_delay(1.5, 2.5)
+                if _budget_ok(3):
+                    self._human_delay(0.8, 1.8)
+                else:
+                    break
 
         return None
 
@@ -1296,155 +1487,48 @@ class DeepBusinessScraper:
         return socials
 
     def _deep_analyze_website(self, page: Page, website_url: str, max_total_time_sec: int = WEBSITE_ANALYSIS_BUDGET_SEC) -> Dict:
-        """Deep website analysis.
-
-        Prefer fast HTTP crawling (email_extractor WebsiteExtractor) and only fall back
-        to Playwright navigation when HTTP yields nothing.
+        """EXTREMELY POWERFUL website analysis.
+        Uses the upgraded WebsiteExtractor that does aggressive HTTP + Playwright rendering.
+        Respects instance prod config for depth.
         """
-        combined_data = {
-            "emails": [],
-            "whatsapp_numbers": [],
-            "socials": {},
-            "has_chatbot": False,
-            "chatbot_type": "",
-            "has_google_analytics": False,
-            "has_meta_pixel": False,
-            "cms_platform": "",
-        }
-
-        # Normalize URL
         if not website_url.startswith(("http://", "https://")):
             website_url = f"https://{website_url}"
 
-        base_url = website_url.rstrip("/")
-
-        start_time = time.time()
-        deadline = start_time + max_total_time_sec if max_total_time_sec else None
-
-        # ---- Phase 1: HTTP crawl (fast) ----
         try:
-            crawler = WebsiteExtractor(timeout=min(12, REQUEST_TIMEOUT))
-            pages = crawler.crawl_pages(
-                base_url,
-                max_pages=10,
-                max_total_time_sec=max_total_time_sec,
+            crawler = WebsiteExtractor(timeout=min(14, REQUEST_TIMEOUT))
+            data = crawler.enrich(
+                website_url,
+                max_pages=self.web_max_pages,
+                max_total_time_sec=max_total_time_sec or self.web_timeout_sec,
+                priority_only=False,
+                use_playwright=True,
             )
-            if pages:
-                corpus = "\n\n".join(p.html for p in pages if p.html)
-                base_domain = _get_base_domain(base_url)
 
-                combined_data["emails"] = list(dict.fromkeys(extract_emails(corpus, base_domain)))
-                combined_data["whatsapp_numbers"] = list(dict.fromkeys(extract_whatsapp(corpus)))
+            # Map to existing + DEEP web intel
+            result = {
+                "emails": [e for e in (data.get("all_emails", "") or "").split("; ") if e][:5],
+                "whatsapp_numbers": [w for w in (data.get("all_whatsapp", "") or "").split("; ") if w][:5],
+                "socials": data.get("socials", {}),
+                "has_chatbot": False,
+                "chatbot_type": "",
+                "has_google_analytics": False,
+                "has_meta_pixel": False,
+                "cms_platform": "",
+                # Very deep powerful web data
+                "web_description": data.get("description", ""),
+                "web_address": data.get("address_from_site", ""),
+                "web_services": data.get("services", ""),
+                "all_phones_from_web": data.get("all_phones", ""),
+                "pages_crawled": data.get("pages_crawled", 0),
+                "structured_data_found": data.get("structured_data_found", False),
+                "web_about": data.get("about_text", ""),
+                "web_hours": data.get("hours", ""),
+            }
 
-                socials = {}
-                for social, patterns, label in [
-                    ("instagram", INSTAGRAM_PATTERNS, "instagram"),
-                    ("facebook", FACEBOOK_PATTERNS, "facebook"),
-                    ("twitter", TWITTER_PATTERNS, "twitter"),
-                    ("linkedin", LINKEDIN_PATTERNS, "linkedin"),
-                    ("tiktok", TIKTOK_PATTERNS, "tiktok"),
-                    ("youtube", YOUTUBE_PATTERNS, "youtube"),
-                ]:
-                    val = extract_social_handle(corpus, patterns, label)
-                    if val:
-                        socials[social] = val
-                combined_data["socials"] = socials
-
-                has_bot, bot_type = detect_chatbot(corpus)
-                combined_data["has_chatbot"] = bool(has_bot)
-                combined_data["chatbot_type"] = bot_type or ""
-
-                analytics = detect_analytics(corpus)
-                combined_data["has_google_analytics"] = bool(analytics.get("google_analytics"))
-                combined_data["has_meta_pixel"] = bool(analytics.get("meta_pixel"))
-                combined_data["cms_platform"] = detect_cms(corpus) or ""
-
-                if combined_data["emails"]:
-                    return combined_data
+            return result
         except Exception as e:
-            self.log.debug("HTTP crawl failed: %s", e)
-
-        # ---- Phase 2: Playwright fallback (JS-heavy) ----
-        pages_to_check = CONTACT_PAGES + SOCIAL_PAGES
-
-        for path in pages_to_check[:8]:
-            if deadline and time.time() > deadline:
-                break
-            try:
-                url = f"{base_url}{path}"
-                response = page.goto(url, timeout=15000, wait_until="domcontentloaded")
-
-                if not response or response.status >= 400:
-                    continue
-
-                page.wait_for_timeout(1200)
-                html = page.content()
-
-                base_domain = _get_base_domain(base_url)
-                page_emails = extract_emails(html, base_domain)
-                page_whatsapp = extract_whatsapp(html)
-
-                for email in page_emails:
-                    if email not in combined_data["emails"]:
-                        combined_data["emails"].append(email)
-
-                for wa in page_whatsapp:
-                    if wa not in combined_data["whatsapp_numbers"]:
-                        combined_data["whatsapp_numbers"].append(wa)
-
-                if not combined_data["socials"].get("instagram"):
-                    ig = extract_social_handle(html, INSTAGRAM_PATTERNS, "instagram")
-                    if ig:
-                        combined_data["socials"]["instagram"] = ig
-
-                if not combined_data["socials"].get("facebook"):
-                    fb = extract_social_handle(html, FACEBOOK_PATTERNS, "facebook")
-                    if fb:
-                        combined_data["socials"]["facebook"] = fb
-
-                if not combined_data["socials"].get("twitter"):
-                    tw = extract_social_handle(html, TWITTER_PATTERNS, "twitter")
-                    if tw:
-                        combined_data["socials"]["twitter"] = tw
-
-                if not combined_data["socials"].get("linkedin"):
-                    li = extract_social_handle(html, LINKEDIN_PATTERNS, "linkedin")
-                    if li:
-                        combined_data["socials"]["linkedin"] = li
-
-                if not combined_data["socials"].get("tiktok"):
-                    tt = extract_social_handle(html, TIKTOK_PATTERNS, "tiktok")
-                    if tt:
-                        combined_data["socials"]["tiktok"] = tt
-
-                if not combined_data["socials"].get("youtube"):
-                    yt = extract_social_handle(html, YOUTUBE_PATTERNS, "youtube")
-                    if yt:
-                        combined_data["socials"]["youtube"] = yt
-
-                if not combined_data["has_chatbot"]:
-                    has_bot, bot_type = detect_chatbot(html)
-                    if has_bot:
-                        combined_data["has_chatbot"] = True
-                        combined_data["chatbot_type"] = bot_type
-
-                analytics = detect_analytics(html)
-                if analytics["google_analytics"]:
-                    combined_data["has_google_analytics"] = True
-                if analytics["meta_pixel"]:
-                    combined_data["has_meta_pixel"] = True
-
-                if not combined_data["cms_platform"]:
-                    combined_data["cms_platform"] = detect_cms(html)
-
-                if combined_data["emails"] and combined_data["whatsapp_numbers"] and combined_data["socials"].get("instagram"):
-                    break
-
-            except Exception as e:
-                self.log.debug("Error analyzing %s: %s", url, e)
-                continue
-
-        return combined_data
+            self.log.debug("Powerful web analysis failed: %s", e)
+            return {"emails": [], "whatsapp_numbers": [], "socials": {}}
 
     def _website_cache_key(self, website_url: str) -> str:
         if not website_url:
