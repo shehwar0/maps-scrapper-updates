@@ -26,6 +26,8 @@ let lastRenderedCount = 0;
 let backendCooldownUntil = 0;
 let locationSuggestController = null;
 let locationSuggestTimer = null;
+let currentTarget = 0;
+let scrapeStartTime = 0;
 
 function canCallBackend() {
   return Date.now() >= backendCooldownUntil;
@@ -477,6 +479,23 @@ function updateStats(rows) {
   }
 }
 
+function updateProgressBar(current, target) {
+  const bar = document.getElementById("progressBar");
+  const text = document.getElementById("progressText");
+  const stats = document.getElementById("progressStats");
+  if (!bar || !text) return;
+
+  const pct = target > 0 ? Math.min(100, Math.floor((current / target) * 100)) : 0;
+  bar.style.width = pct + "%";
+  text.textContent = `${current} / ${target} (${pct}%)`;
+
+  if (stats && scrapeStartTime) {
+    const elapsed = ((Date.now() - scrapeStartTime) / 1000).toFixed(1);
+    const rate = current > 0 ? (elapsed / current).toFixed(1) : "0";
+    stats.textContent = `Elapsed: ${elapsed}s | ~${rate}s per lead`;
+  }
+}
+
 function truncate(str, maxLen) {
   if (!str) return "";
   return str.length > maxLen ? str.substring(0, maxLen) + "..." : str;
@@ -494,62 +513,63 @@ function renderRows(rows) {
     return;
   }
 
+  // For performance on large results: use DocumentFragment
+  const fragment = document.createDocumentFragment();
+
   rows.forEach((row) => {
     const tr = document.createElement("tr");
 
-    // Address cell (truncated)
-    const addressCell = row.address ? `<span title="${row.address}">${truncate(row.address, 30)}</span>` : "—";
-
-    // Website cell with link
+    const addressCell = row.address ? `<span title="${row.address}">${truncate(row.address, 25)}</span>` : "—";
     const websiteCell = row.website
-      ? `<a href="${row.website}" target="_blank" rel="noopener noreferrer" title="${row.website}">🔗 Visit</a>`
-      : "❌";
-
-    // Instagram with link
-    const instagramCell = row.instagram
-      ? `<a href="${row.instagram}" target="_blank" title="Instagram">📸 View</a>`
+      ? `<a href="${row.website}" target="_blank" rel="noopener noreferrer">🔗</a>`
       : "—";
 
-    // Facebook with link
-    const facebookCell = row.facebook
-      ? `<a href="${row.facebook}" target="_blank" title="Facebook">👤 View</a>`
-      : "—";
+    // Rich Web Info (new powerful fields)
+    const webInfo = [];
+    if (row.web_description) webInfo.push(`📝 ${truncate(row.web_description, 40)}`);
+    if (row.web_services) webInfo.push(`🛠 ${truncate(row.web_services, 30)}`);
+    if (row.web_hours) webInfo.push(`⏰ ${row.web_hours}`);
+    const webInfoCell = webInfo.length ? webInfo.join("<br>") : (row.web_about ? truncate(row.web_about, 50) : "—");
 
-    // Rating display
+    // Combined socials
+    const socialsCell = [
+      row.instagram ? `<a href="${row.instagram}" target="_blank">📸</a>` : "",
+      row.facebook ? `<a href="${row.facebook}" target="_blank">👤</a>` : "",
+      row.twitter ? `<a href="${row.twitter}" target="_blank">🐦</a>` : "",
+      row.linkedin ? `<a href="${row.linkedin}" target="_blank">💼</a>` : ""
+    ].filter(Boolean).join(" ") || "—";
+
     const ratingCell = row.rating ? `⭐ ${row.rating}` : "—";
-
-    // Quality badge
     const qualityClass = row.quality_score === "high" ? "quality-high" : row.quality_score === "medium" ? "quality-medium" : "quality-low";
     const qualityCell = `<span class="quality ${qualityClass}">${(row.quality_score || "?").toUpperCase()}</span>`;
 
-    const whatsappCell = row.whatsapp || "—";
+    const emailCell = row.email || (row.all_emails ? truncate(row.all_emails.split(";")[0], 20) : "—");
+    const phoneCell = row.phone || (row.all_phones ? truncate(row.all_phones.split(";")[0], 15) : "—");
 
-    const waMeLinks = (row.whatsapp_wa_me_links || "").split(";").map((entry) => entry.trim()).filter(Boolean);
-    const whatsappLinkCell = waMeLinks.length > 0
-      ? waMeLinks
-          .map((link) => `<a href="${link}" target="_blank" rel="noopener noreferrer" title="Open WhatsApp">Open</a>`)
-          .join(" | ")
-      : (row.whatsapp
-          ? `<a href="https://wa.me/${row.whatsapp.replace(/[^0-9]/g, "")}" target="_blank" rel="noopener noreferrer" title="Open WhatsApp">Open</a>`
-          : "—");
+    const whatsappCell = row.whatsapp || "—";
+    const waLink = row.whatsapp ? `<a href="https://wa.me/${row.whatsapp.replace(/[^0-9]/g, "")}" target="_blank">💬</a>` : "—";
 
     tr.innerHTML = `
-      <td title="${row.name || ''}">${truncate(row.name, 25) || "—"}</td>
+      <td title="${row.name || ''}">${truncate(row.name, 22) || "—"}</td>
       <td>${addressCell}</td>
-      <td>${row.phone || "—"}</td>
+      <td>${phoneCell}</td>
       <td>${whatsappCell}</td>
-      <td>${whatsappLinkCell}</td>
-      <td>${row.email || "—"}</td>
+      <td>${emailCell}</td>
       <td>${websiteCell}</td>
-      <td>${instagramCell}</td>
-      <td>${facebookCell}</td>
+      <td style="font-size:0.8em; max-width:220px;">${webInfoCell}</td>
+      <td>${socialsCell}</td>
       <td>${ratingCell}</td>
       <td>${qualityCell}</td>
+      <td>
+        ${waLink}
+        ${row.website ? `<a href="${row.website}" target="_blank">🌐</a>` : ""}
+      </td>
     `;
 
-    bodyEl.appendChild(tr);
+    fragment.appendChild(tr);
   });
 
+  bodyEl.appendChild(fragment);
   lastRenderedCount = rows.length;
 }
 
@@ -573,6 +593,9 @@ async function fetchStatus() {
     if (Array.isArray(data?.results) && data.results.length !== lastRenderedCount) {
       renderRows(data.results);
       downloadBtn.disabled = !(data.results.length > 0);
+    } else if (currentTarget > 0 && data?.count !== undefined) {
+      // Update progress even without full re-render
+      updateProgressBar(data.count || 0, currentTarget);
     }
 
     if (data?.message) {
@@ -587,6 +610,13 @@ async function fetchStatus() {
       downloadBtn.disabled = !(data.count > 0);
       fetchHistoryStats();
       fetchOutputHistoryFiles();
+
+      // Hide or finalize progress bar
+      const progressSection = document.getElementById("progressSection");
+      if (progressSection) {
+        setTimeout(() => { progressSection.style.display = "none"; }, 2500);
+      }
+      currentTarget = 0;
     }
   } catch {
     markBackendUnavailable("Backend connection lost. Please restart server.");
@@ -620,6 +650,7 @@ startBtn.addEventListener("click", async () => {
   const deepSearch = document.getElementById("deepSearch").checked;
   const verifySocials = document.getElementById("verifySocials")?.checked ?? true;
   const skipDuplicates = document.getElementById("skipDuplicates")?.checked ?? true;
+  const dryRun = document.getElementById("dryRun")?.checked ?? false; // test 100s instantly & safely
   const chosenHistoryFiles = getSelectedHistoryFiles();
 
   maxResultsInput.value = String(maxResults);
@@ -651,6 +682,14 @@ startBtn.addEventListener("click", async () => {
   stopRequestedByUser = false;
   activeScrapeController = new AbortController();
   setStatus(statusMsg);
+
+  // Setup progress bar
+  currentTarget = maxResults;
+  scrapeStartTime = Date.now();
+  const progressSection = document.getElementById("progressSection");
+  if (progressSection) progressSection.style.display = "block";
+  updateProgressBar(0, currentTarget);
+
   startPolling();
 
   try {
@@ -667,6 +706,8 @@ startBtn.addEventListener("click", async () => {
         deep_search: deepSearch,
         verify_socials: verifySocials,
         skip_duplicates: skipDuplicates,
+        dry_run: dryRun,
+        card_only: cardOnly,
         selected_history_files: chosenHistoryFiles,
         headless,
       }),
@@ -679,9 +720,15 @@ startBtn.addEventListener("click", async () => {
       return;
     }
 
-    renderRows(data.results || []);
-    setStatus(data.message || `Completed. ${data.count || 0} NEW leads collected.`);
-    downloadBtn.disabled = !(data.count > 0);
+    // Background mode: initial response is "started", live results arrive via polling
+    if (data && (data.status === "started" || data.status === "running")) {
+      setStatus(data.message || "Scrape started... monitoring progress");
+      // polling already active and will render live + final
+    } else {
+      renderRows(data.results || []);
+      setStatus(data.message || `Completed. ${data.count || 0} leads collected.`);
+      downloadBtn.disabled = !(data.count > 0);
+    }
     stopRequestedByUser = false;
     
     // Refresh history stats after scraping
@@ -698,10 +745,9 @@ startBtn.addEventListener("click", async () => {
     }
   } finally {
     activeScrapeController = null;
-    if (!stopRequestedByUser) {
-      setRunningState(false);
-      stopPolling();
-    }
+    // Do NOT stop polling here: the scrape runs in background.
+    // Polling self-stops when /status reports running=false.
+    // Keep setRunningState true until polling confirms completion.
   }
 });
 

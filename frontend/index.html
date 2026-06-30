@@ -72,6 +72,14 @@
           <input id="skipDuplicates" type="checkbox" checked />
           🆕 Skip previously scraped businesses (get NEW results each time)
         </label>
+        <label class="checkbox-row" style="background:#fffbeb;border:1px solid #f0c36b;padding:3px 6px;border-radius:3px;margin-top:3px">
+          <input id="dryRun" type="checkbox" />
+          <strong>🧪 DRY-RUN (POWER TEST)</strong> — generate perfect synthetic data instantly for 100+ results. No browser, no blocks, test everything safely &amp; fast.
+        </label>
+        <label class="checkbox-row" style="background:#e6f4ea;border:1px solid #81c784;padding:3px 6px;border-radius:3px;margin-top:2px">
+          <input id="cardOnly" type="checkbox" />
+          <strong>⚡ CARD-ONLY (BEST SPEED)</strong> — real data from Maps cards only. Super fast for 100-500, skips slow website crawling.
+        </label>
       </div>
 
       <div class="history-info" id="historyInfo" style="display:none;">
@@ -79,6 +87,19 @@
           📊 Previously scraped: <span id="historyCount">0</span> businesses for this search
           <button id="clearHistoryBtn" class="small-btn" title="Reset to get all results including previous ones">Clear History</button>
         </small>
+      </div>
+
+      <div class="progress-section" id="progressSection" style="display:none; margin: 12px 0;">
+        <div class="progress-label">
+          <strong>Scraping Progress</strong>
+          <span id="progressText">0 / 0 (0%)</span>
+        </div>
+        <div class="progress-bar-container">
+          <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+        </div>
+        <div class="progress-stats">
+          <span id="progressStats">Starting...</span>
+        </div>
       </div>
 
       <div class="history-files" id="historyFilesPanel">
@@ -125,13 +146,13 @@
               <th>Address</th>
               <th>Phone</th>
               <th>WhatsApp</th>
-              <th>WhatsApp Link</th>
               <th>Email</th>
               <th>Website</th>
-              <th>Instagram</th>
-              <th>Facebook</th>
+              <th>Web Info</th>
+              <th>Socials</th>
               <th>Rating</th>
               <th>Quality</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="resultsBody"></tbody>

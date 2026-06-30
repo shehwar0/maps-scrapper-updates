@@ -1155,6 +1155,28 @@ class DeepBusinessScraper:
                 pass
 
         self.log.info("📊 %d collected, %d dups skipped (hybrid card+page)", len(leads), skipped_duplicates)
+
+        # POWER BOOST: Parallel deep web enrichment for leads with websites (speeds up 100+ runs significantly)
+        leads_with_web = [l for l in leads if getattr(l, 'website', None)]
+        if leads_with_web:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            max_workers = min(6, len(leads_with_web))
+            self.log.info(f"🚀 Parallel deep web enrichment for {len(leads_with_web)} sites (workers={max_workers})")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_lead = {executor.submit(self._deep_analyze_website, None, lead.website, getattr(self, 'web_timeout_sec', 30)): lead for lead in leads_with_web if lead.website}
+                for future in as_completed(future_to_lead):
+                    lead = future_to_lead[future]
+                    try:
+                        web_data = future.result()
+                        if web_data:
+                            lead.emails = web_data.get("emails", []) or getattr(lead, 'emails', [])
+                            lead.whatsapp_numbers = web_data.get("whatsapp_numbers", []) or getattr(lead, 'whatsapp_numbers', [])
+                            for k in ["web_description", "web_services", "web_about", "web_hours", "web_address"]:
+                                if web_data.get(k) and not getattr(lead, k, None):
+                                    setattr(lead, k, web_data[k])
+                    except Exception as e:
+                        self.log.warning(f"Parallel web enrich failed: {e}")
+
         return leads
 
     def _passes_website_filter(self, website: str) -> bool:
